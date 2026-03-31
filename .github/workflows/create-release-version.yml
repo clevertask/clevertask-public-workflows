@@ -23,11 +23,8 @@ on:
         default: ".nvmrc"
         type: string
     secrets:
-      deployment_key:
-        description: SSH deploy key used to push the release commit and tag
-        required: true
       github_pat:
-        description: Personal access token used to create the GitHub release
+        description: Personal access token used for checkout, push, and GitHub release creation
         required: true
 
 permissions:
@@ -42,6 +39,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v5
+        with:
+          token: ${{ secrets.github_pat }}
 
       - uses: actions/setup-node@v5
         with:
@@ -69,17 +68,6 @@ jobs:
           fi
 
           git commit -m "chore(release): bump version to v${{ inputs.version }}"
-
-      - name: Setup SSH for deploy key
-        run: |
-          mkdir -p ~/.ssh
-          echo "${{ secrets.deployment_key }}" > ~/.ssh/id_ed25519
-          chmod 600 ~/.ssh/id_ed25519
-          ssh-keyscan github.com >> ~/.ssh/known_hosts
-
-      - name: Set Git remote to SSH
-        run: |
-          git remote set-url origin git@github.com:${{ github.repository }}.git
 
       - name: Create Git tag and push
         run: |

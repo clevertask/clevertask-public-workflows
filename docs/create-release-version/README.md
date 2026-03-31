@@ -17,10 +17,8 @@ the repository, pushing the commit/tag, and creating a GitHub release.
 
 ## Required Secrets
 
-- `deployment_key`:
-  SSH deploy key used to push the release commit and tag.
 - `github_pat`:
-  Personal access token used to create the GitHub release.
+  Personal access token used for checkout, push, and GitHub release creation.
 
 ## Example
 
@@ -50,6 +48,5 @@ jobs:
       version: ${{ inputs.version }}
       prerelease: ${{ inputs.prerelease }}
     secrets:
-      deployment_key: ${{ secrets.CLEVERTASK_DEPLOYMENT_KEY }}
       github_pat: ${{ secrets.CLEVERTASK_PAT }}
 ```
