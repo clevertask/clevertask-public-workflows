@@ -1,0 +1,58 @@
+name: Publish npm Package
+
+on:
+  workflow_call:
+    inputs:
+      dist_tag:
+        description: npm dist-tag to publish under (for example latest or next)
+        required: false
+        default: "latest"
+        type: string
+      working_directory:
+        description: Directory containing the package to publish
+        required: false
+        default: "."
+        type: string
+      node_version_file:
+        description: Path to the Node version file in the caller repository
+        required: false
+        default: ".nvmrc"
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version-file: ${{ inputs.node_version_file }}
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Install pnpm
+        run: npm install -g pnpm
+
+      - name: Install dependencies
+        working-directory: ${{ inputs.working_directory }}
+        run: pnpm install --frozen-lockfile
+
+      - name: Run formatting check
+        working-directory: ${{ inputs.working_directory }}
+        run: pnpm run fmt:check
+
+      - name: Build package
+        working-directory: ${{ inputs.working_directory }}
+        run: pnpm build
+
+      - name: Publish package
+        working-directory: ${{ inputs.working_directory }}
+        run: pnpm publish --no-git-checks --tag "${{ inputs.dist_tag }}"

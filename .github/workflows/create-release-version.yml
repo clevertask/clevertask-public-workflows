@@ -1,0 +1,103 @@
+name: Create Release Version
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: Version to release (for example 0.1.0 or 1.0.0-alpha.0)
+        required: true
+        type: string
+      prerelease:
+        description: Mark the GitHub release as a prerelease
+        required: false
+        default: false
+        type: boolean
+      working_directory:
+        description: Directory containing package.json and the optional pnpm lockfile
+        required: false
+        default: "."
+        type: string
+      node_version_file:
+        description: Path to the Node version file in the caller repository
+        required: false
+        default: ".nvmrc"
+        type: string
+    secrets:
+      deployment_key:
+        description: SSH deploy key used to push the release commit and tag
+        required: true
+      github_pat:
+        description: Personal access token used to create the GitHub release
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version-file: ${{ inputs.node_version_file }}
+
+      - name: Install pnpm
+        run: npm install -g pnpm
+
+      - name: Setup Git
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "github-actions@clevertask.ai"
+
+      - name: Bump version in package.json
+        working-directory: ${{ inputs.working_directory }}
+        run: |
+          pnpm version "${{ inputs.version }}" --no-git-tag-version
+
+      - name: Commit release version
+        run: |
+          git add "${{ inputs.working_directory }}/package.json"
+
+          if [ -f "${{ inputs.working_directory }}/pnpm-lock.yaml" ]; then
+            git add "${{ inputs.working_directory }}/pnpm-lock.yaml"
+          fi
+
+          git commit -m "chore(release): bump version to v${{ inputs.version }}"
+
+      - name: Setup SSH for deploy key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.deployment_key }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan github.com >> ~/.ssh/known_hosts
+
+      - name: Set Git remote to SSH
+        run: |
+          git remote set-url origin git@github.com:${{ github.repository }}.git
+
+      - name: Create Git tag and push
+        run: |
+          git tag "v${{ inputs.version }}"
+          git push origin HEAD
+          git push origin "v${{ inputs.version }}"
+
+      - name: Create GitHub release with notes
+        env:
+          GH_TOKEN: ${{ secrets.github_pat }}
+        run: |
+          prerelease_flag=""
+
+          if [ "${{ inputs.prerelease }}" = "true" ]; then
+            prerelease_flag="--prerelease"
+          fi
+
+          gh release create "v${{ inputs.version }}" \
+            --title "v${{ inputs.version }}" \
+            --generate-notes \
+            ${prerelease_flag}
