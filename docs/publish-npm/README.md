@@ -16,6 +16,9 @@ Reusable workflow for publishing a pnpm-based package to npm.
 
 - This workflow is intended to be called from a local wrapper workflow in the
   consumer repository.
+- It installs exact `corepack@0.34.5`, selects exact `pnpm@11.17.0`, verifies
+  the active pnpm version from the package directory, and installs dependencies
+  with `--frozen-lockfile`.
 - It uses `pnpm publish --no-git-checks` so detached-HEAD CI contexts do not
   block releases.
 - For npm trusted publishing, configure the trusted publisher against the local
