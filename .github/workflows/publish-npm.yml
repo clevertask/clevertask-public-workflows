@@ -37,6 +37,7 @@ jobs:
         with:
           node-version-file: ${{ inputs.node_version_file }}
           registry-url: "https://registry.npmjs.org"
+          package-manager-cache: false
 
       - name: Install Corepack and pnpm
         working-directory: ${{ inputs.working_directory }}
