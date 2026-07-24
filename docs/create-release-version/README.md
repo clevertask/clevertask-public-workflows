@@ -20,6 +20,14 @@ the repository, pushing the commit/tag, and creating a GitHub release.
 - `github_pat`:
   Personal access token used for checkout, push, and GitHub release creation.
 
+## Notes
+
+- This workflow installs exact `corepack@0.34.5`, selects exact
+  `pnpm@11.17.0`, and verifies the active pnpm version from the package
+  directory before changing package metadata.
+- It does not install dependencies; its pnpm step only bumps package metadata
+  and an optional lockfile before the Git and GitHub release operations.
+
 ## Example
 
 ```yaml

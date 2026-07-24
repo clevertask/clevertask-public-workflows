@@ -46,8 +46,13 @@ jobs:
         with:
           node-version-file: ${{ inputs.node_version_file }}
 
-      - name: Install pnpm
-        run: npm install -g pnpm
+      - name: Install Corepack and pnpm
+        working-directory: ${{ inputs.working_directory }}
+        run: |
+          npm install --global corepack@0.34.5
+          corepack enable
+          corepack install --global pnpm@11.17.0
+          test "$(pnpm --version)" = "11.17.0"
 
       - name: Setup Git
         run: |

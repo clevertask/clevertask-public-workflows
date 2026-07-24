@@ -17,9 +17,12 @@ automation for public/open-source repos that we want to maintain in one place.
 - Local wrappers map repository-specific secrets into the reusable workflows.
 - Local wrappers keep stable workflow filenames for npm trusted publishing and
   repo-specific conventions.
+- Shared workflows install exact `corepack@0.34.5`, select exact
+  `pnpm@11.17.0`, and verify the active pnpm version from the package directory
+  before running package commands.
 
 ## Current Consumers
 
+- `clevertask/kanban-board-ui`
+- `clevertask/react-sortable-tree`
 - `clevertask/scribe`
-
-More repositories can be migrated as the shared contracts settle.
