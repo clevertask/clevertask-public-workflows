@@ -1,0 +1,726 @@
+name: Update pnpm Dependencies
+
+on:
+  workflow_call:
+    inputs:
+      package_roots:
+        description: JSON array of package roots relative to the caller repository
+        required: true
+        type: string
+      node_version_file:
+        description: Node version file relative to the caller repository
+        required: false
+        default: ".nvmrc"
+        type: string
+      validation_script:
+        description: Caller-owned validation script relative to the repository root
+        required: false
+        default: ".github/scripts/validate-dependency-update.sh"
+        type: string
+    outputs:
+      changed:
+        description: Whether dependency files changed
+        value: ${{ jobs.prepare.outputs.changed }}
+      pull_request_url:
+        description: Existing or newly created dependency-update pull request
+        value: ${{ jobs.publish.outputs.pull_request_url || jobs.prepare.outputs.pull_request_url }}
+      skipped:
+        description: Whether the run skipped because an automation pull request is open
+        value: ${{ jobs.publish.outputs.skipped || jobs.prepare.outputs.skipped }}
+      validation_status:
+        description: Caller validation outcome
+        value: ${{ jobs.prepare.outputs.validation_status }}
+
+permissions: {}
+
+concurrency:
+  group: weekly-pnpm-dependency-update-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read # Detect an existing automation PR before updating.
+    defaults:
+      run:
+        shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+    outputs:
+      artifact_id: ${{ steps.dependency_snapshot.outputs.artifact-id }}
+      base_sha: ${{ steps.base.outputs.sha }}
+      changed: ${{ steps.changes.outputs.changed || 'false' }}
+      pull_request_url: ${{ steps.open_pull_request.outputs.url }}
+      skipped: ${{ steps.open_pull_request.outputs.skipped || 'false' }}
+      validation_status: ${{ steps.validation.outcome || 'skipped' }}
+
+    steps:
+      - name: Check out the caller repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Record the update base
+        id: base
+        run: echo "sha=$(/usr/bin/git rev-parse HEAD)" >> "${GITHUB_OUTPUT}"
+
+      - name: Skip while an automation pull request is open
+        id: open_pull_request
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          branch_prefix="chore/weekly-dependency-update-"
+          open_pull_request_url="$(
+            gh pr list \
+              --state open \
+              --limit 100 \
+              --json headRefName,isCrossRepository,url |
+              jq --raw-output \
+                --arg prefix "${branch_prefix}" \
+                'map(
+                  select(
+                    (.isCrossRepository | not) and
+                    (.headRefName | startswith($prefix))
+                  )
+                ) | .[0].url // ""'
+          )"
+
+          if [ -n "${open_pull_request_url}" ]; then
+            echo "An automation pull request is already open: ${open_pull_request_url}"
+            echo "skipped=true" >> "${GITHUB_OUTPUT}"
+            echo "url=${open_pull_request_url}" >> "${GITHUB_OUTPUT}"
+          else
+            echo "skipped=false" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Validate caller inputs
+        if: steps.open_pull_request.outputs.skipped != 'true'
+        env:
+          NODE_VERSION_FILE: ${{ inputs.node_version_file }}
+          PACKAGE_ROOTS: ${{ inputs.package_roots }}
+          VALIDATION_SCRIPT: ${{ inputs.validation_script }}
+        run: |
+          repository_root="$(/usr/bin/realpath "${GITHUB_WORKSPACE}")"
+
+          validate_repository_path() {
+            local path="$1"
+            local kind="$2"
+
+            if [[ "${path}" = /* ]] || [[ "${path}" == ".." ]] ||
+              [[ "${path}" == ../* ]] || [[ "${path}" == */../* ]] ||
+              [[ "${path}" == */.. ]]; then
+              echo "::error::${kind} must stay inside the caller repository: ${path}"
+              exit 1
+            fi
+
+            if [ ! -e "${path}" ]; then
+              echo "::error::${kind} does not exist: ${path}"
+              exit 1
+            fi
+
+            local resolved_path
+            resolved_path="$(/usr/bin/realpath "${path}")"
+
+            case "${resolved_path}" in
+              "${repository_root}" | "${repository_root}"/*) ;;
+              *)
+                echo "::error::${kind} resolves outside the caller repository: ${path}"
+                exit 1
+                ;;
+            esac
+          }
+
+          if ! /usr/bin/jq --exit-status '
+            type == "array" and
+            length > 0 and
+            all(.[]; type == "string" and length > 0 and (test("[\\r\\n]") | not)) and
+            (unique | length) == length
+          ' <<< "${PACKAGE_ROOTS}" > /dev/null; then
+            echo '::error::package_roots must be a non-empty JSON array of unique paths.'
+            exit 1
+          fi
+
+          raw_package_roots="${RUNNER_TEMP}/dependency-update-package-roots-input"
+          validated_package_roots="${RUNNER_TEMP}/dependency-update-package-roots"
+          /usr/bin/jq --raw-output '.[]' <<< "${PACKAGE_ROOTS}" > "${raw_package_roots}"
+          : > "${validated_package_roots}"
+          declare -A seen_package_roots=()
+
+          while IFS= read -r package_root; do
+            validate_repository_path "${package_root}" "Package root"
+
+            if [ ! -f "${package_root}/package.json" ]; then
+              echo "::error::Package root has no package.json: ${package_root}"
+              exit 1
+            fi
+
+            if [ ! -f "${package_root}/pnpm-lock.yaml" ]; then
+              echo "::error::Package root has no pnpm-lock.yaml: ${package_root}"
+              exit 1
+            fi
+
+            resolved_package_root="$(/usr/bin/realpath "${package_root}")"
+
+            if [[ -n "${seen_package_roots[${resolved_package_root}]+present}" ]]; then
+              echo "::error::Package roots resolve to the same directory: ${package_root}"
+              exit 1
+            fi
+
+            seen_package_roots["${resolved_package_root}"]=true
+            /usr/bin/realpath \
+              --relative-to="${repository_root}" \
+              "${resolved_package_root}" \
+              >> "${validated_package_roots}"
+          done < "${raw_package_roots}"
+
+          validate_repository_path "${NODE_VERSION_FILE}" "Node version file"
+          validate_repository_path "${VALIDATION_SCRIPT}" "Validation script"
+
+      - name: Set up Node
+        if: steps.open_pull_request.outputs.skipped != 'true'
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: ${{ inputs.node_version_file }}
+          package-manager-cache: false
+
+      - name: Install Corepack and pnpm
+        if: steps.open_pull_request.outputs.skipped != 'true'
+        run: | # zizmor: ignore[adhoc-packages] Corepack is centrally and exactly pinned.
+          npm install --global corepack@0.34.5
+          corepack enable
+          corepack install --global pnpm@11.17.0
+          test "$(pnpm --version)" = "11.17.0"
+
+      - name: Update dependencies
+        if: steps.open_pull_request.outputs.skipped != 'true'
+        run: |
+          node_major="$(node --print "process.versions.node.split('.')[0]")"
+          node_lts_codename="$(node --print "process.release.lts ?? ''")"
+
+          if [[ ! "${node_major}" =~ ^[0-9]+$ ]]; then
+            echo "::error::Could not resolve the active Node major."
+            exit 1
+          fi
+
+          if [ -z "${node_lts_codename}" ]; then
+            echo "::error::The configured Node runtime is not an LTS release."
+            exit 1
+          fi
+
+          while IFS= read -r package_root; do
+            echo "::group::Update ${package_root}"
+
+            (
+              cd "${package_root}"
+
+              package_manager="$(
+                node --print "require('./package.json').packageManager ?? ''"
+              )"
+
+              if [ "${package_manager}" != "pnpm@11.17.0" ]; then
+                echo "::error::${package_root}/package.json must declare pnpm@11.17.0."
+                exit 1
+              fi
+
+              pnpm_config="$(pnpm config list --json)"
+              minimum_release_age="$(
+                jq --raw-output '.minimumReleaseAge // empty' <<< "${pnpm_config}"
+              )"
+
+              if [ "${minimum_release_age}" != "4320" ]; then
+                echo "::error::${package_root}/pnpm-workspace.yaml must set minimumReleaseAge: 4320."
+                exit 1
+              fi
+
+              if ! jq --exit-status '
+                (.updateConfig.ignoreDependencies // []) |
+                index("@types/node") != null
+              ' <<< "${pnpm_config}" > /dev/null; then
+                echo "::error::${package_root}/pnpm-workspace.yaml must ignore @types/node during latest updates."
+                exit 1
+              fi
+
+              pnpm up --latest
+
+              if node --eval '
+                const packageJson = require("./package.json");
+                const dependencyFields = [
+                  "dependencies",
+                  "devDependencies",
+                  "optionalDependencies",
+                ];
+                const hasNodeTypes = dependencyFields.some(
+                  (field) => packageJson[field]?.["@types/node"],
+                );
+                process.exit(hasNodeTypes ? 0 : 1);
+              '; then
+                pnpm up "@types/node@${node_major}"
+
+                installed_node_types_major="$(
+                  node --print \
+                    "require('./node_modules/@types/node/package.json').version.split('.')[0]"
+                )"
+
+                if [ "${installed_node_types_major}" != "${node_major}" ]; then
+                  echo "::error::@types/node does not match Node ${node_major} in ${package_root}."
+                  exit 1
+                fi
+              fi
+            )
+
+            echo "::endgroup::"
+          done < "${RUNNER_TEMP}/dependency-update-package-roots"
+
+      - name: Detect dependency changes
+        id: changes
+        if: steps.open_pull_request.outputs.skipped != 'true'
+        run: |
+          if [ -z "$(/usr/bin/git status --porcelain)" ]; then
+            echo "No dependency changes are available."
+            echo "changed=false" >> "${GITHUB_OUTPUT}"
+          else
+            /usr/bin/git diff --check
+            echo "changed=true" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Snapshot dependency changes
+        if: steps.changes.outputs.changed == 'true'
+        run: |
+          if ! /usr/bin/git diff --cached --quiet; then
+            echo "::error::The dependency update staged files before the snapshot boundary."
+            /usr/bin/git diff --cached --name-only
+            exit 1
+          fi
+
+          allowed_paths="${RUNNER_TEMP}/dependency-update-allowed-paths"
+          changed_paths="${RUNNER_TEMP}/dependency-update-changed-paths"
+          artifact_root="${RUNNER_TEMP}/dependency-update-artifact"
+          : > "${allowed_paths}"
+          /usr/bin/mkdir --parents "${artifact_root}"
+
+          while IFS= read -r package_root; do
+            package_manifest="$(
+              /usr/bin/realpath \
+                --relative-to="${GITHUB_WORKSPACE}" \
+                "${package_root}/package.json"
+            )"
+            lockfile="$(
+              /usr/bin/realpath \
+                --relative-to="${GITHUB_WORKSPACE}" \
+                "${package_root}/pnpm-lock.yaml"
+            )"
+            printf '%s\n' "${package_manifest}" "${lockfile}" >> "${allowed_paths}"
+          done < "${RUNNER_TEMP}/dependency-update-package-roots"
+
+          {
+            /usr/bin/git diff --name-only
+            /usr/bin/git ls-files --others --exclude-standard
+          } | /usr/bin/sort --unique > "${changed_paths}"
+
+          if [ ! -s "${changed_paths}" ]; then
+            echo "::error::Dependency changes were detected but no changed paths were found."
+            exit 1
+          fi
+
+          while IFS= read -r changed_path; do
+            if ! /usr/bin/grep \
+              --fixed-strings \
+              --line-regexp \
+              -- "${changed_path}" "${allowed_paths}" > /dev/null; then
+              echo "::error::Unexpected dependency-update file: ${changed_path}"
+              exit 1
+            fi
+          done < "${changed_paths}"
+
+          while IFS= read -r allowed_path; do
+            if [ ! -f "${allowed_path}" ] || [ -L "${allowed_path}" ]; then
+              echo "::error::Dependency artifact source must be a regular file: ${allowed_path}"
+              exit 1
+            fi
+
+            destination="${artifact_root}/${allowed_path}"
+            /usr/bin/mkdir --parents "$(/usr/bin/dirname "${destination}")"
+            /usr/bin/cp \
+              --no-preserve=mode,ownership,timestamps \
+              -- "${allowed_path}" "${destination}"
+            /usr/bin/git add -- "${allowed_path}"
+          done < "${allowed_paths}"
+
+          while IFS= read -r staged_path; do
+            if ! /usr/bin/grep \
+              --fixed-strings \
+              --line-regexp \
+              -- "${staged_path}" "${allowed_paths}" > /dev/null; then
+              echo "::error::Unexpected staged dependency-update file: ${staged_path}"
+              exit 1
+            fi
+          done < <(/usr/bin/git diff --cached --name-only)
+
+          if ! /usr/bin/git diff --quiet ||
+            [ -n "$(/usr/bin/git ls-files --others --exclude-standard)" ]; then
+            echo "::error::The dependency update changed files outside the allowed snapshot."
+            /usr/bin/git status --short
+            exit 1
+          fi
+
+          /usr/bin/git diff --cached --check
+          /usr/bin/git switch \
+            --create "validation-snapshot-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          /usr/bin/git config user.name "GitHub Actions"
+          /usr/bin/git config user.email "github-actions@clevertask.ai"
+          /usr/bin/git \
+            -c core.hooksPath=/dev/null \
+            commit \
+            --no-verify \
+            --message "chore(deps): validate dependency snapshot"
+
+      - name: Upload the dependency snapshot
+        id: dependency_snapshot
+        if: steps.changes.outputs.changed == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dependency-update-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/dependency-update-artifact
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Verify the dependency snapshot upload
+        if: steps.changes.outputs.changed == 'true'
+        env:
+          ARTIFACT_ID: ${{ steps.dependency_snapshot.outputs.artifact-id }}
+        run: test -n "${ARTIFACT_ID}"
+
+      - name: Run caller validation
+        id: validation
+        if: steps.changes.outputs.changed == 'true'
+        continue-on-error: true
+        env:
+          VALIDATION_SCRIPT: ${{ inputs.validation_script }}
+        run: |
+          /usr/bin/bash "${VALIDATION_SCRIPT}"
+
+          if [ -n "$(/usr/bin/git status --porcelain)" ]; then
+            echo "::error::The validation script left the repository dirty."
+            /usr/bin/git status --short
+            exit 1
+          fi
+
+  publish:
+    needs: prepare
+    if: >-
+      needs.prepare.result == 'success' &&
+      needs.prepare.outputs.skipped != 'true' &&
+      needs.prepare.outputs.changed == 'true' &&
+      needs.prepare.outputs.artifact_id != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # Push the isolated dependency-update branch.
+      pull-requests: write # Open the reviewable draft PR.
+    defaults:
+      run:
+        shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+    outputs:
+      pull_request_url: ${{ steps.pull_request.outputs.url || steps.open_pull_request.outputs.url }}
+      skipped: ${{ steps.open_pull_request.outputs.skipped || 'false' }}
+
+    steps:
+      - name: Check out the validated base
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ needs.prepare.outputs.base_sha }}
+
+      - name: Recheck for an automation pull request
+        id: open_pull_request
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          EXPECTED_BASE_SHA: ${{ needs.prepare.outputs.base_sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          branch_prefix="chore/weekly-dependency-update-"
+          open_pull_request_url="$(
+            gh pr list \
+              --state open \
+              --limit 100 \
+              --json headRefName,isCrossRepository,url |
+              jq --raw-output \
+                --arg prefix "${branch_prefix}" \
+                'map(
+                  select(
+                    (.isCrossRepository | not) and
+                    (.headRefName | startswith($prefix))
+                  )
+                ) | .[0].url // ""'
+          )"
+
+          if [ -n "${open_pull_request_url}" ]; then
+            echo "An automation pull request appeared during preparation: ${open_pull_request_url}"
+            echo "skipped=true" >> "${GITHUB_OUTPUT}"
+            echo "url=${open_pull_request_url}" >> "${GITHUB_OUTPUT}"
+          else
+            current_base_sha="$(
+              gh api \
+                "repos/${GITHUB_REPOSITORY}/commits/${DEFAULT_BRANCH}" \
+                --jq '.sha'
+            )"
+
+            if [ "${current_base_sha}" != "${EXPECTED_BASE_SHA}" ]; then
+              echo "::error::The default branch moved during dependency preparation. Rerun the full workflow."
+              exit 1
+            fi
+
+            echo "skipped=false" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Download the dependency snapshot
+        if: steps.open_pull_request.outputs.skipped != 'true'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.prepare.outputs.artifact_id }}
+          digest-mismatch: error
+          merge-multiple: true
+          path: ${{ runner.temp }}/dependency-update-artifact
+
+      - name: Validate and apply the dependency snapshot
+        if: steps.open_pull_request.outputs.skipped != 'true'
+        env:
+          PACKAGE_ROOTS: ${{ inputs.package_roots }}
+        run: |
+          repository_root="$(/usr/bin/realpath "${GITHUB_WORKSPACE}")"
+          artifact_root="${RUNNER_TEMP}/dependency-update-artifact"
+          allowed_paths="${RUNNER_TEMP}/dependency-update-allowed-paths"
+          artifact_paths="${RUNNER_TEMP}/dependency-update-artifact-paths"
+          validated_package_roots="${RUNNER_TEMP}/dependency-update-package-roots"
+          : > "${allowed_paths}"
+          : > "${validated_package_roots}"
+
+          if ! /usr/bin/jq --exit-status '
+            type == "array" and
+            length > 0 and
+            all(.[]; type == "string" and length > 0 and (test("[\\r\\n]") | not))
+          ' <<< "${PACKAGE_ROOTS}" > /dev/null; then
+            echo '::error::package_roots must be a non-empty JSON array of paths.'
+            exit 1
+          fi
+
+          declare -A seen_package_roots=()
+
+          while IFS= read -r package_root; do
+            if [[ "${package_root}" = /* ]] || [[ "${package_root}" == ".." ]] ||
+              [[ "${package_root}" == ../* ]] || [[ "${package_root}" == */../* ]] ||
+              [[ "${package_root}" == */.. ]]; then
+              echo "::error::Package root must stay inside the caller repository: ${package_root}"
+              exit 1
+            fi
+
+            if [ ! -f "${package_root}/package.json" ] ||
+              [ ! -f "${package_root}/pnpm-lock.yaml" ]; then
+              echo "::error::Package root is incomplete on the validated base: ${package_root}"
+              exit 1
+            fi
+
+            resolved_package_root="$(/usr/bin/realpath "${package_root}")"
+
+            case "${resolved_package_root}" in
+              "${repository_root}" | "${repository_root}"/*) ;;
+              *)
+                echo "::error::Package root resolves outside the caller repository: ${package_root}"
+                exit 1
+                ;;
+            esac
+
+            if [[ -n "${seen_package_roots[${resolved_package_root}]+present}" ]]; then
+              echo "::error::Package roots resolve to the same directory: ${package_root}"
+              exit 1
+            fi
+
+            seen_package_roots["${resolved_package_root}"]=true
+            normalized_package_root="$(
+              /usr/bin/realpath \
+                --relative-to="${repository_root}" \
+                "${resolved_package_root}"
+            )"
+            printf '%s\n' "${normalized_package_root}" >> "${validated_package_roots}"
+            printf '%s\n' \
+              "${normalized_package_root}/package.json" \
+              "${normalized_package_root}/pnpm-lock.yaml" \
+              >> "${allowed_paths}"
+          done < <(/usr/bin/jq --raw-output '.[]' <<< "${PACKAGE_ROOTS}")
+
+          /usr/bin/sed --in-place 's#^\./##' "${allowed_paths}"
+          /usr/bin/sort --unique --output="${allowed_paths}" "${allowed_paths}"
+
+          unexpected_artifact_entry="$(
+            /usr/bin/find "${artifact_root}" \
+              -mindepth 1 \
+              ! -type d \
+              ! -type f \
+              -print \
+              -quit
+          )"
+
+          if [ -n "${unexpected_artifact_entry}" ]; then
+            echo "::error::Dependency artifact contains a non-regular entry: ${unexpected_artifact_entry}"
+            exit 1
+          fi
+
+          (
+            cd "${artifact_root}"
+            /usr/bin/find . -type f -printf '%P\n' | /usr/bin/sort --unique
+          ) > "${artifact_paths}"
+
+          if ! /usr/bin/diff --unified "${allowed_paths}" "${artifact_paths}"; then
+            echo "::error::Dependency artifact paths do not match the caller package roots."
+            exit 1
+          fi
+
+          while IFS= read -r allowed_path; do
+            artifact_file="${artifact_root}/${allowed_path}"
+            destination="${repository_root}/${allowed_path}"
+
+            if [ ! -f "${artifact_file}" ] || [ -L "${artifact_file}" ]; then
+              echo "::error::Dependency artifact must contain a regular file: ${allowed_path}"
+              exit 1
+            fi
+
+            /usr/bin/cp \
+              --no-preserve=mode,ownership,timestamps \
+              -- "${artifact_file}" "${destination}"
+          done < "${allowed_paths}"
+
+          if [ -z "$(/usr/bin/git status --porcelain)" ]; then
+            echo "::error::The dependency artifact contains no changes against its base."
+            exit 1
+          fi
+
+          while IFS= read -r changed_path; do
+            if ! /usr/bin/grep \
+              --fixed-strings \
+              --line-regexp \
+              -- "${changed_path}" "${allowed_paths}" > /dev/null; then
+              echo "::error::Applied dependency artifact changed an unexpected file: ${changed_path}"
+              exit 1
+            fi
+          done < <(/usr/bin/git diff --name-only)
+
+          /usr/bin/git diff --check
+
+      - name: Commit the dependency snapshot
+        id: commit
+        if: steps.open_pull_request.outputs.skipped != 'true'
+        env:
+          BRANCH_NAME: chore/weekly-dependency-update-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          /usr/bin/git switch --create "${BRANCH_NAME}"
+          /usr/bin/git config user.name "GitHub Actions"
+          /usr/bin/git config user.email "github-actions@clevertask.ai"
+
+          while IFS= read -r allowed_path; do
+            /usr/bin/git add -- "${allowed_path}"
+          done < "${RUNNER_TEMP}/dependency-update-allowed-paths"
+
+          while IFS= read -r staged_path; do
+            if ! /usr/bin/grep \
+              --fixed-strings \
+              --line-regexp \
+              -- "${staged_path}" \
+              "${RUNNER_TEMP}/dependency-update-allowed-paths" > /dev/null; then
+              echo "::error::Unexpected staged dependency-update file: ${staged_path}"
+              exit 1
+            fi
+          done < <(/usr/bin/git diff --cached --name-only)
+
+          if ! /usr/bin/git diff --quiet ||
+            [ -n "$(/usr/bin/git ls-files --others --exclude-standard)" ]; then
+            echo "::error::The publish job contains changes outside the dependency snapshot."
+            /usr/bin/git status --short
+            exit 1
+          fi
+
+          /usr/bin/git diff --cached --check
+          /usr/bin/git \
+            -c core.hooksPath=/dev/null \
+            commit \
+            --no-verify \
+            --message "chore(deps): update dependencies"
+          echo "branch=${BRANCH_NAME}" >> "${GITHUB_OUTPUT}"
+
+      - name: Push the dependency-update branch
+        if: steps.open_pull_request.outputs.skipped != 'true'
+        env:
+          BRANCH_NAME: ${{ steps.commit.outputs.branch }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          /usr/bin/git push \
+            "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+            "HEAD:refs/heads/${BRANCH_NAME}"
+
+      - name: Open a draft pull request
+        id: pull_request
+        if: steps.open_pull_request.outputs.skipped != 'true'
+        env:
+          BRANCH_NAME: ${{ steps.commit.outputs.branch }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          GH_TOKEN: ${{ github.token }}
+          VALIDATION_OUTCOME: ${{ needs.prepare.outputs.validation_status }}
+        run: |
+          if [ "${VALIDATION_OUTCOME}" = "success" ]; then
+            validation_summary="Passed in the read-only dependency-update job."
+          else
+            validation_summary="Failed in the read-only dependency-update job. Review the run before merging."
+          fi
+
+          {
+            echo "## Why"
+            echo
+            echo "Keep direct and transitive pnpm dependencies current in one reviewable batch."
+            echo
+            echo "## What changed"
+            echo
+            echo "- Ran \`pnpm up --latest\` in every configured package root."
+            echo "- Kept direct \`@types/node\` dependencies on the active Node LTS major."
+            echo "- Regenerated the affected pnpm lockfiles."
+            echo
+            echo "## Validation"
+            echo
+            echo "${validation_summary}"
+            echo
+            echo "Workflow run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            echo
+            echo "## Not included"
+            echo
+            echo "This automation does not merge, publish, deploy, or update pnpm, Corepack, or GitHub Action references."
+          } > "${RUNNER_TEMP}/dependency-update-pr.md"
+
+          pull_request_url="$(
+            gh pr create \
+              --base "${DEFAULT_BRANCH}" \
+              --head "${BRANCH_NAME}" \
+              --title "chore(deps): weekly dependency update" \
+              --body-file "${RUNNER_TEMP}/dependency-update-pr.md" \
+              --draft
+          )"
+
+          echo "url=${pull_request_url}" >> "${GITHUB_OUTPUT}"
+
+  report_validation_failure:
+    needs:
+      - prepare
+      - publish
+    if: >-
+      always() &&
+      needs.prepare.result == 'success' &&
+      needs.prepare.outputs.changed == 'true' &&
+      needs.prepare.outputs.validation_status == 'failure' &&
+      needs.publish.result == 'success' &&
+      needs.publish.outputs.skipped != 'true'
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Report validation failure
+        run: |
+          echo "::error::The draft pull request was created, but caller validation failed."
+          exit 1
