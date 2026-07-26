@@ -4,7 +4,7 @@ on:
   workflow_call:
     inputs:
       version:
-        description: Version to release (for example 0.1.0 or 1.0.0-alpha.0)
+        description: Version to release without build metadata (for example 0.1.0 or 1.0.0-alpha.0)
         required: true
         type: string
       prerelease:
@@ -24,74 +24,383 @@ on:
         type: string
     secrets:
       github_pat:
-        description: Personal access token used for checkout, push, and GitHub release creation
+        description: Personal access token used to push and create the GitHub release
         required: true
 
-permissions:
-  contents: write
+permissions: {}
 
 jobs:
   release:
+    name: Create release version
     runs-on: ubuntu-latest
+    permissions:
+      contents: read # Checkout uses the job token; release writes use the explicit PAT.
+    env:
+      NODE_VERSION_FILE: ${{ inputs.node_version_file }}
+      RELEASE_BRANCH: ${{ github.ref_name }}
+      RELEASE_PRERELEASE: ${{ inputs.prerelease }}
+      RELEASE_REF: ${{ github.ref }}
+      RELEASE_REF_TYPE: ${{ github.ref_type }}
+      RELEASE_VERSION: ${{ inputs.version }}
+      WORKING_DIRECTORY: ${{ inputs.working_directory }}
     defaults:
       run:
-        shell: bash
+        shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          token: ${{ secrets.github_pat }}
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.ref }}
 
-      - uses: actions/setup-node@v5
+      - name: Validate release inputs
+        id: paths
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          repository_root="$(/usr/bin/realpath -- "${GITHUB_WORKSPACE}")"
+          supported_version_pattern='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*))?$'
+
+          if [[ ! "${RELEASE_VERSION}" =~ ${supported_version_pattern} ]]; then
+            echo "::error::version must be a semantic version without a leading v or build metadata."
+            exit 1
+          fi
+
+          if [ "${RELEASE_REF_TYPE}" != "branch" ] ||
+            [ "${RELEASE_REF}" != "refs/heads/${RELEASE_BRANCH}" ] ||
+            ! git check-ref-format --branch "${RELEASE_BRANCH}" > /dev/null; then
+            echo "::error::Releases must be created from a valid branch ref."
+            exit 1
+          fi
+
+          if [[ "${WORKING_DIRECTORY}" == *$'\r'* ]] ||
+            [[ "${WORKING_DIRECTORY}" == *$'\n'* ]] ||
+            [[ "${WORKING_DIRECTORY}" = /* ]] ||
+            [[ "${WORKING_DIRECTORY}" == ".." ]] ||
+            [[ "${WORKING_DIRECTORY}" == ../* ]] ||
+            [[ "${WORKING_DIRECTORY}" == */../* ]] ||
+            [[ "${WORKING_DIRECTORY}" == */.. ]] ||
+            [ ! -d "${WORKING_DIRECTORY}" ] ||
+            [ -L "${WORKING_DIRECTORY}" ] ||
+            [ ! -f "${WORKING_DIRECTORY}/package.json" ] ||
+            [ -L "${WORKING_DIRECTORY}/package.json" ]; then
+            echo "::error::working_directory must contain package.json inside the caller repository."
+            exit 1
+          fi
+
+          resolved_working_directory="$(
+            /usr/bin/realpath -- "${WORKING_DIRECTORY}"
+          )"
+
+          case "${resolved_working_directory}" in
+            "${repository_root}" | "${repository_root}"/*) ;;
+            *)
+              echo "::error::working_directory resolves outside the caller repository."
+              exit 1
+              ;;
+          esac
+
+          if [ -e "${WORKING_DIRECTORY}/pnpm-lock.yaml" ] &&
+            {
+              [ ! -f "${WORKING_DIRECTORY}/pnpm-lock.yaml" ] ||
+                [ -L "${WORKING_DIRECTORY}/pnpm-lock.yaml" ]
+            }; then
+            echo "::error::pnpm-lock.yaml must be a regular file when present."
+            exit 1
+          fi
+
+          if [[ "${NODE_VERSION_FILE}" == *$'\r'* ]] ||
+            [[ "${NODE_VERSION_FILE}" == *$'\n'* ]] ||
+            [[ "${NODE_VERSION_FILE}" = /* ]] ||
+            [[ "${NODE_VERSION_FILE}" == ".." ]] ||
+            [[ "${NODE_VERSION_FILE}" == ../* ]] ||
+            [[ "${NODE_VERSION_FILE}" == */../* ]] ||
+            [[ "${NODE_VERSION_FILE}" == */.. ]] ||
+            [ ! -f "${NODE_VERSION_FILE}" ] ||
+            [ -L "${NODE_VERSION_FILE}" ]; then
+            echo "::error::node_version_file must be a file inside the caller repository."
+            exit 1
+          fi
+
+          resolved_node_version_file="$(
+            /usr/bin/realpath -- "${NODE_VERSION_FILE}"
+          )"
+
+          case "${resolved_node_version_file}" in
+            "${repository_root}"/*) ;;
+            *)
+              echo "::error::node_version_file resolves outside the caller repository."
+              exit 1
+              ;;
+          esac
+
+          resume_release=false
+          release_exists=false
+
+          if git rev-parse \
+            --verify \
+            --quiet \
+            "refs/tags/v${RELEASE_VERSION}" > /dev/null; then
+            tag_commit="$(
+              git rev-list --max-count=1 "refs/tags/v${RELEASE_VERSION}"
+            )"
+            current_version="$(
+              /usr/bin/jq \
+                --raw-output \
+                '.version // ""' \
+                -- \
+                "${resolved_working_directory}/package.json"
+            )"
+
+            if [ "${tag_commit}" != "$(git rev-parse HEAD)" ] ||
+              [ "${current_version}" != "${RELEASE_VERSION}" ]; then
+              echo "::error::The existing release tag does not match this branch and package version."
+              exit 1
+            fi
+
+            resume_release=true
+
+            if gh release view "v${RELEASE_VERSION}" > /dev/null 2>&1; then
+              release_exists=true
+            fi
+          fi
+
+          normalized_working_directory="$(
+            /usr/bin/realpath \
+              --relative-to="${repository_root}" \
+              -- \
+              "${resolved_working_directory}"
+          )"
+          normalized_node_version_file="$(
+            /usr/bin/realpath \
+              --relative-to="${repository_root}" \
+              -- \
+              "${resolved_node_version_file}"
+          )"
+          echo "node_version_file=${normalized_node_version_file}" >> "${GITHUB_OUTPUT}"
+          echo "release_exists=${release_exists}" >> "${GITHUB_OUTPUT}"
+          echo "resume_release=${resume_release}" >> "${GITHUB_OUTPUT}"
+          echo "working_directory=${normalized_working_directory}" >> "${GITHUB_OUTPUT}"
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        if: steps.paths.outputs.resume_release != 'true'
         with:
-          node-version-file: ${{ inputs.node_version_file }}
+          node-version-file: ${{ steps.paths.outputs.node_version_file }}
           package-manager-cache: false
 
       - name: Install Corepack and pnpm
-        working-directory: ${{ inputs.working_directory }}
-        run: |
-          npm install --global corepack@0.34.5
+        id: toolchain
+        if: steps.paths.outputs.resume_release != 'true'
+        env:
+          VALIDATED_WORKING_DIRECTORY: ${{ steps.paths.outputs.working_directory }}
+        run: | # zizmor: ignore[adhoc-packages] Corepack is centrally and exactly pinned.
+          cd -- "${VALIDATED_WORKING_DIRECTORY}"
+          npm install --global --ignore-scripts corepack@0.34.5
           corepack enable
-          corepack install --global pnpm@11.17.0
-          test "$(pnpm --version)" = "11.17.0"
+          test "$(corepack --version)" = "0.34.5"
+
+          package_manager="$(
+            node --print "require('./package.json').packageManager ?? ''"
+          )"
+
+          if [[ ! "${package_manager}" =~ ^pnpm@([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+            echo "::error::package.json must declare an exact pnpm version in packageManager."
+            exit 1
+          fi
+
+          expected_pnpm_version="${BASH_REMATCH[1]}"
+
+          if node --eval '
+            const packageJson = require("./package.json");
+            process.exit(
+              packageJson.devEngines?.packageManager != null ? 0 : 1,
+            );
+          '; then
+            echo "::error::package.json must not define devEngines.packageManager."
+            exit 1
+          fi
+
+          corepack install --global "${package_manager}"
+          test "$(pnpm --version)" = "${expected_pnpm_version}"
+          echo "package_manager=${package_manager}" >> "${GITHUB_OUTPUT}"
 
       - name: Setup Git
+        if: steps.paths.outputs.resume_release != 'true'
         run: |
           git config user.name "GitHub Actions"
           git config user.email "github-actions@clevertask.ai"
 
       - name: Bump version in package.json
-        working-directory: ${{ inputs.working_directory }}
+        if: steps.paths.outputs.resume_release != 'true'
+        env:
+          PACKAGE_MANAGER: ${{ steps.toolchain.outputs.package_manager }}
+          VALIDATED_WORKING_DIRECTORY: ${{ steps.paths.outputs.working_directory }}
         run: |
-          pnpm version "${{ inputs.version }}" --no-git-tag-version
-
-      - name: Commit release version
-        run: |
-          git add "${{ inputs.working_directory }}/package.json"
-
-          if [ -f "${{ inputs.working_directory }}/pnpm-lock.yaml" ]; then
-            git add "${{ inputs.working_directory }}/pnpm-lock.yaml"
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "::error::The release checkout is not clean before versioning."
+            git status --short
+            exit 1
           fi
 
-          git commit -m "chore(release): bump version to v${{ inputs.version }}"
+          cd -- "${VALIDATED_WORKING_DIRECTORY}"
+          corepack "${PACKAGE_MANAGER}" version \
+            "${RELEASE_VERSION}" \
+            --no-git-tag-version \
+            --no-commit-hooks \
+            --config.ignore-scripts=true
 
-      - name: Create Git tag and push
+      - name: Commit release version
+        if: steps.paths.outputs.resume_release != 'true'
+        env:
+          EXPECTED_PACKAGE_MANAGER: ${{ steps.toolchain.outputs.package_manager }}
+          VALIDATED_WORKING_DIRECTORY: ${{ steps.paths.outputs.working_directory }}
         run: |
-          git tag "v${{ inputs.version }}"
-          git push origin HEAD
-          git push origin "v${{ inputs.version }}"
+          repository_root="$(/usr/bin/realpath -- "${GITHUB_WORKSPACE}")"
+          allowed_paths="${RUNNER_TEMP}/release-version-allowed-paths"
+          changed_paths="${RUNNER_TEMP}/release-version-changed-paths"
+          package_manifest="$(
+            /usr/bin/realpath \
+              --relative-to="${repository_root}" \
+              -- \
+              "${VALIDATED_WORKING_DIRECTORY}/package.json"
+          )"
+          : > "${allowed_paths}"
+          printf '%s\n' "${package_manifest}" >> "${allowed_paths}"
+
+          if [ -f "${VALIDATED_WORKING_DIRECTORY}/pnpm-lock.yaml" ]; then
+            if [ -L "${VALIDATED_WORKING_DIRECTORY}/pnpm-lock.yaml" ]; then
+              echo "::error::pnpm-lock.yaml must not be a symbolic link."
+              exit 1
+            fi
+
+            lockfile="$(
+              /usr/bin/realpath \
+                --relative-to="${repository_root}" \
+                -- \
+                "${VALIDATED_WORKING_DIRECTORY}/pnpm-lock.yaml"
+            )"
+            printf '%s\n' "${lockfile}" >> "${allowed_paths}"
+          fi
+
+          {
+            git diff --name-only
+            git diff --cached --name-only
+            git ls-files --others --exclude-standard
+          } | /usr/bin/sort --unique > "${changed_paths}"
+
+          if [ ! -s "${changed_paths}" ]; then
+            echo "::error::The version command did not change package metadata."
+            exit 1
+          fi
+
+          actual_version="$(
+            /usr/bin/jq --raw-output '.version // ""' -- "${package_manifest}"
+          )"
+          actual_package_manager="$(
+            /usr/bin/jq \
+              --raw-output \
+              '.packageManager // ""' \
+              -- \
+              "${package_manifest}"
+          )"
+
+          if [ "${actual_version}" != "${RELEASE_VERSION}" ]; then
+            echo "::error::package.json does not contain the requested release version."
+            exit 1
+          fi
+
+          if [ "${actual_package_manager}" != "${EXPECTED_PACKAGE_MANAGER}" ]; then
+            echo "::error::Versioning changed packageManager."
+            exit 1
+          fi
+
+          while IFS= read -r changed_path; do
+            if ! /usr/bin/grep \
+              --fixed-strings \
+              --line-regexp \
+              -- "${changed_path}" "${allowed_paths}" > /dev/null; then
+              echo "::error::Versioning changed an unexpected file: ${changed_path}"
+              exit 1
+            fi
+          done < "${changed_paths}"
+
+          while IFS= read -r allowed_path; do
+            git add -- "${allowed_path}"
+          done < "${allowed_paths}"
+
+          while IFS= read -r staged_path; do
+            if ! /usr/bin/grep \
+              --fixed-strings \
+              --line-regexp \
+              -- "${staged_path}" "${allowed_paths}" > /dev/null; then
+              echo "::error::An unexpected release file was staged: ${staged_path}"
+              exit 1
+            fi
+          done < <(git diff --cached --name-only)
+
+          if ! git diff --quiet ||
+            [ -n "$(git ls-files --others --exclude-standard)" ]; then
+            echo "::error::Release versioning left changes outside the staged allowlist."
+            git status --short
+            exit 1
+          fi
+
+          git diff --cached --check
+          git \
+            -c core.hooksPath=/dev/null \
+            -c commit.gpgsign=false \
+            commit \
+            --no-verify \
+            -m "chore(release): bump version to v${RELEASE_VERSION}"
+
+          while IFS= read -r committed_path; do
+            if ! /usr/bin/grep \
+              --fixed-strings \
+              --line-regexp \
+              -- "${committed_path}" "${allowed_paths}" > /dev/null; then
+              echo "::error::The release commit contains an unexpected file: ${committed_path}"
+              exit 1
+            fi
+          done < <(git diff-tree --no-commit-id --name-only -r HEAD)
+
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "::error::The release worktree is dirty after committing."
+            git status --short
+            exit 1
+          fi
+
+      - name: Create Git tag
+        if: steps.paths.outputs.resume_release != 'true'
+        run: git -c tag.gpgSign=false tag "v${RELEASE_VERSION}"
+
+      - name: Push release commit and tag
+        if: steps.paths.outputs.resume_release != 'true'
+        env:
+          GITHUB_PAT: ${{ secrets.github_pat }}
+        run: |
+          git -c core.hooksPath=/dev/null push --atomic \
+            "https://x-access-token:${GITHUB_PAT}@github.com/${GITHUB_REPOSITORY}.git" \
+            "HEAD:refs/heads/${RELEASE_BRANCH}" \
+            "refs/tags/v${RELEASE_VERSION}:refs/tags/v${RELEASE_VERSION}"
 
       - name: Create GitHub release with notes
+        if: steps.paths.outputs.release_exists != 'true'
         env:
           GH_TOKEN: ${{ secrets.github_pat }}
         run: |
-          prerelease_flag=""
+          release_arguments=(
+            "v${RELEASE_VERSION}"
+            --title "v${RELEASE_VERSION}"
+            --generate-notes
+          )
 
-          if [ "${{ inputs.prerelease }}" = "true" ]; then
-            prerelease_flag="--prerelease"
+          if [ "${RELEASE_PRERELEASE}" = "true" ]; then
+            release_arguments+=(--prerelease)
           fi
 
-          gh release create "v${{ inputs.version }}" \
-            --title "v${{ inputs.version }}" \
-            --generate-notes \
-            ${prerelease_flag}
+          gh release create "${release_arguments[@]}"
+
+      - name: Report an existing release
+        if: steps.paths.outputs.release_exists == 'true'
+        run: echo "GitHub release v${RELEASE_VERSION} already exists."

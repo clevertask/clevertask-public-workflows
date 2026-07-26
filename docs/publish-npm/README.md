@@ -16,11 +16,22 @@ Reusable workflow for publishing a pnpm-based package to npm.
 
 - This workflow is intended to be called from a local wrapper workflow in the
   consumer repository.
-- It installs exact `corepack@0.34.5`, selects exact `pnpm@11.17.0`, verifies
-  the active pnpm version from the package directory, and installs dependencies
-  with `--frozen-lockfile`.
-- It uses `pnpm publish --no-git-checks` so detached-HEAD CI contexts do not
-  block releases.
+- It installs exact `corepack@0.34.5`, selects and verifies the exact pnpm
+  version declared by the package's `packageManager`, requires pnpm 11.1.3 or
+  newer for trusted publishing, and installs dependencies with
+  `--frozen-lockfile`.
+- `packageManager` is the only package-manager declaration;
+  `devEngines.packageManager` must not be set.
+- The source package version may use SemVer prerelease identifiers such as
+  `-alpha.1` or `-beta.1`. Build metadata such as `+build.7` is rejected before
+  packing because pnpm removes it from the published package version.
+- A read-only preparation job runs formatting, the build, `prepublishOnly` when
+  present, and `pnpm pack`. Package lifecycle code has no npm OIDC token.
+- Only the resulting tarball crosses into a fresh OIDC-enabled job. That job
+  has no checkout, verifies the artifact identity, filename, and tarball
+  SHA-256, then publishes with `--ignore-scripts` and `--no-git-checks`.
+- `prepack`, `prepare`, and `postpack` may run during packing in the read-only
+  job. `publish` and `postpublish` scripts do not run in the privileged job.
 - For npm trusted publishing, configure the trusted publisher against the local
   wrapper workflow filename in the consumer repository.
 
@@ -47,7 +58,7 @@ permissions:
 
 jobs:
   publish:
-    uses: clevertask/clevertask-public-workflows/.github/workflows/publish-npm.yml@main
+    uses: clevertask/clevertask-public-workflows/.github/workflows/publish-npm.yml@<FULL_COMMIT_SHA>
     with:
       dist_tag: ${{ inputs.dist_tag }}
 ```
