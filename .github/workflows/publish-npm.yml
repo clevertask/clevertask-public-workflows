@@ -19,46 +19,353 @@ on:
         default: ".nvmrc"
         type: string
 
-permissions:
-  id-token: write
-  contents: read
+permissions: {}
 
 jobs:
-  publish:
+  prepare:
+    name: Build npm package
     runs-on: ubuntu-latest
+    permissions:
+      contents: read # Checkout the package that will be published.
+    env:
+      DIST_TAG: ${{ inputs.dist_tag }}
+      NODE_VERSION_FILE: ${{ inputs.node_version_file }}
+      WORKING_DIRECTORY: ${{ inputs.working_directory }}
     defaults:
       run:
-        shell: bash
+        shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+    outputs:
+      artifact_digest: ${{ steps.package_artifact.outputs.artifact-digest }}
+      artifact_id: ${{ steps.package_artifact.outputs.artifact-id }}
+      node_version: ${{ steps.toolchain.outputs.node_version }}
+      package_file: ${{ steps.package.outputs.file }}
+      package_sha256: ${{ steps.package.outputs.sha256 }}
+      pnpm_version: ${{ steps.toolchain.outputs.pnpm_version }}
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-node@v5
+      - name: Validate publish inputs
+        run: |
+          repository_root="$(/usr/bin/realpath -- "${GITHUB_WORKSPACE}")"
+
+          if [[ ! "${DIST_TAG}" =~ ^[0-9A-Za-z][0-9A-Za-z._-]*$ ]]; then
+            echo "::error::dist_tag contains unsupported characters."
+            exit 1
+          fi
+
+          if [[ "${WORKING_DIRECTORY}" == *$'\r'* ]] ||
+            [[ "${WORKING_DIRECTORY}" == *$'\n'* ]] ||
+            [[ "${WORKING_DIRECTORY}" = /* ]] ||
+            [[ "${WORKING_DIRECTORY}" == ".." ]] ||
+            [[ "${WORKING_DIRECTORY}" == ../* ]] ||
+            [[ "${WORKING_DIRECTORY}" == */../* ]] ||
+            [[ "${WORKING_DIRECTORY}" == */.. ]] ||
+            [ ! -d "${WORKING_DIRECTORY}" ] ||
+            [ -L "${WORKING_DIRECTORY}" ] ||
+            [ ! -f "${WORKING_DIRECTORY}/package.json" ] ||
+            [ -L "${WORKING_DIRECTORY}/package.json" ]; then
+            echo "::error::working_directory must contain package.json inside the caller repository."
+            exit 1
+          fi
+
+          resolved_working_directory="$(
+            /usr/bin/realpath -- "${WORKING_DIRECTORY}"
+          )"
+
+          case "${resolved_working_directory}" in
+            "${repository_root}" | "${repository_root}"/*) ;;
+            *)
+              echo "::error::working_directory resolves outside the caller repository."
+              exit 1
+              ;;
+          esac
+
+          if [[ "${NODE_VERSION_FILE}" == *$'\r'* ]] ||
+            [[ "${NODE_VERSION_FILE}" == *$'\n'* ]] ||
+            [[ "${NODE_VERSION_FILE}" = /* ]] ||
+            [[ "${NODE_VERSION_FILE}" == ".." ]] ||
+            [[ "${NODE_VERSION_FILE}" == ../* ]] ||
+            [[ "${NODE_VERSION_FILE}" == */../* ]] ||
+            [[ "${NODE_VERSION_FILE}" == */.. ]] ||
+            [ ! -f "${NODE_VERSION_FILE}" ] ||
+            [ -L "${NODE_VERSION_FILE}" ]; then
+            echo "::error::node_version_file must be a file inside the caller repository."
+            exit 1
+          fi
+
+          resolved_node_version_file="$(
+            /usr/bin/realpath -- "${NODE_VERSION_FILE}"
+          )"
+
+          case "${resolved_node_version_file}" in
+            "${repository_root}"/*) ;;
+            *)
+              echo "::error::node_version_file resolves outside the caller repository."
+              exit 1
+              ;;
+          esac
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version-file: ${{ inputs.node_version_file }}
-          registry-url: "https://registry.npmjs.org"
           package-manager-cache: false
 
       - name: Install Corepack and pnpm
-        working-directory: ${{ inputs.working_directory }}
-        run: |
-          npm install --global corepack@0.34.5
+        id: toolchain
+        run: | # zizmor: ignore[adhoc-packages] Corepack is centrally and exactly pinned.
+          cd -- "${WORKING_DIRECTORY}"
+          npm install --global --ignore-scripts corepack@0.34.5
           corepack enable
-          corepack install --global pnpm@11.17.0
-          test "$(pnpm --version)" = "11.17.0"
+          test "$(corepack --version)" = "0.34.5"
+
+          package_manager="$(
+            node --print "require('./package.json').packageManager ?? ''"
+          )"
+
+          if [[ ! "${package_manager}" =~ ^pnpm@([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+            echo "::error::package.json must declare an exact pnpm version in packageManager."
+            exit 1
+          fi
+
+          expected_pnpm_version="${BASH_REMATCH[1]}"
+          IFS=. read -r pnpm_major pnpm_minor pnpm_patch <<< "${expected_pnpm_version}"
+          pnpm_major="$((10#${pnpm_major}))"
+          pnpm_minor="$((10#${pnpm_minor}))"
+          pnpm_patch="$((10#${pnpm_patch}))"
+
+          if ((pnpm_major < 11)) ||
+            ((pnpm_major == 11 && pnpm_minor < 1)) ||
+            ((pnpm_major == 11 && pnpm_minor == 1 && pnpm_patch < 3)); then
+            echo "::error::npm trusted publishing requires pnpm 11.1.3 or newer."
+            exit 1
+          fi
+
+          if node --eval '
+            const packageJson = require("./package.json");
+            process.exit(
+              packageJson.devEngines?.packageManager != null ? 0 : 1,
+            );
+          '; then
+            echo "::error::package.json must not define devEngines.packageManager."
+            exit 1
+          fi
+
+          corepack install --global "${package_manager}"
+          test "$(pnpm --version)" = "${expected_pnpm_version}"
+          node_version="$(node --print "process.versions.node")"
+
+          if [[ ! "${node_version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Could not resolve an exact Node version."
+            exit 1
+          fi
+
+          echo "node_version=${node_version}" >> "${GITHUB_OUTPUT}"
+          echo "pnpm_version=${expected_pnpm_version}" >> "${GITHUB_OUTPUT}"
 
       - name: Install dependencies
-        working-directory: ${{ inputs.working_directory }}
-        run: pnpm install --frozen-lockfile
+        run: |
+          cd -- "${WORKING_DIRECTORY}"
+          pnpm install --frozen-lockfile
 
       - name: Run formatting check
-        working-directory: ${{ inputs.working_directory }}
-        run: pnpm run fmt:check
+        run: |
+          cd -- "${WORKING_DIRECTORY}"
+          pnpm run fmt:check
 
       - name: Build package
-        working-directory: ${{ inputs.working_directory }}
-        run: pnpm build
+        run: |
+          cd -- "${WORKING_DIRECTORY}"
+          pnpm build
 
-      - name: Publish package
-        working-directory: ${{ inputs.working_directory }}
-        run: pnpm publish --no-git-checks --tag "${{ inputs.dist_tag }}"
+      - name: Run package publish checks
+        run: |
+          cd -- "${WORKING_DIRECTORY}"
+
+          if node --eval '
+            const packageJson = require("./package.json");
+            process.exit(packageJson.scripts?.prepublishOnly ? 0 : 1);
+          '; then
+            pnpm run prepublishOnly
+          fi
+
+      - name: Pack the validated package
+        id: package
+        run: |
+          package_artifact_root="${RUNNER_TEMP}/npm-package"
+          /usr/bin/mkdir --parents "${package_artifact_root}"
+
+          if [ -n "$(
+            /usr/bin/find "${package_artifact_root}" -mindepth 1 -print -quit
+          )" ]; then
+            echo "::error::The package artifact directory is not empty."
+            exit 1
+          fi
+
+          (
+            cd -- "${WORKING_DIRECTORY}"
+            pnpm pack --pack-destination "${package_artifact_root}"
+          )
+
+          unexpected_entry="$(
+            /usr/bin/find "${package_artifact_root}" \
+              -mindepth 1 \
+              ! -type f \
+              -print \
+              -quit
+          )"
+
+          if [ -n "${unexpected_entry}" ]; then
+            echo "::error::The package artifact contains a non-regular entry."
+            exit 1
+          fi
+
+          mapfile -t package_files < <(
+            /usr/bin/find "${package_artifact_root}" \
+              -mindepth 1 \
+              -maxdepth 1 \
+              -type f \
+              -name '*.tgz' \
+              -printf '%f\n'
+          )
+
+          if [ "${#package_files[@]}" -ne 1 ]; then
+            echo "::error::pnpm pack must create exactly one tarball."
+            exit 1
+          fi
+
+          package_file="${package_files[0]}"
+
+          if [[ ! "${package_file}" =~ ^[0-9A-Za-z][0-9A-Za-z._-]*\.tgz$ ]]; then
+            echo "::error::pnpm pack created an unsupported tarball name."
+            exit 1
+          fi
+
+          package_sha256="$(
+            /usr/bin/sha256sum "${package_artifact_root}/${package_file}" |
+              /usr/bin/cut --delimiter=' ' --fields=1
+          )"
+
+          echo "file=${package_file}" >> "${GITHUB_OUTPUT}"
+          echo "sha256=${package_sha256}" >> "${GITHUB_OUTPUT}"
+
+      - name: Upload the validated package
+        id: package_artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: npm-package-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/npm-package/${{ steps.package.outputs.file }}
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Verify the package upload
+        env:
+          ARTIFACT_DIGEST: ${{ steps.package_artifact.outputs.artifact-digest }}
+          ARTIFACT_ID: ${{ steps.package_artifact.outputs.artifact-id }}
+        run: |
+          if [[ ! "${ARTIFACT_ID}" =~ ^[0-9]+$ ]] ||
+            [[ ! "${ARTIFACT_DIGEST}" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::The package upload returned invalid artifact metadata."
+            exit 1
+          fi
+
+  publish:
+    name: Publish npm package
+    needs: prepare
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # npm trusted publishing exchanges this OIDC token.
+    env:
+      DIST_TAG: ${{ inputs.dist_tag }}
+      EXPECTED_PACKAGE_FILE: ${{ needs.prepare.outputs.package_file }}
+      EXPECTED_PACKAGE_SHA256: ${{ needs.prepare.outputs.package_sha256 }}
+      PNPM_VERSION: ${{ needs.prepare.outputs.pnpm_version }}
+    defaults:
+      run:
+        shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+
+    steps:
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ needs.prepare.outputs.node_version }}
+          registry-url: "https://registry.npmjs.org"
+          package-manager-cache: false
+
+      - name: Install the validated package manager
+        run: | # zizmor: ignore[adhoc-packages] Corepack is centrally and exactly pinned.
+          if [[ ! "${PNPM_VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::The prepared pnpm version is invalid."
+            exit 1
+          fi
+
+          npm install --global --ignore-scripts corepack@0.34.5
+          corepack enable
+          test "$(corepack --version)" = "0.34.5"
+          test "$(
+            corepack "pnpm@${PNPM_VERSION}" --version
+          )" = "${PNPM_VERSION}"
+
+      - name: Download the validated package
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.prepare.outputs.artifact_id }}
+          digest-mismatch: error
+          path: ${{ runner.temp }}/npm-package
+
+      - name: Verify the package artifact
+        run: |
+          package_artifact_root="${RUNNER_TEMP}/npm-package"
+
+          if [[ ! "${DIST_TAG}" =~ ^[0-9A-Za-z][0-9A-Za-z._-]*$ ]] ||
+            [[ ! "${EXPECTED_PACKAGE_FILE}" =~ ^[0-9A-Za-z][0-9A-Za-z._-]*\.tgz$ ]] ||
+            [[ ! "${EXPECTED_PACKAGE_SHA256}" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::The prepared publish metadata is invalid."
+            exit 1
+          fi
+
+          unexpected_entry="$(
+            /usr/bin/find "${package_artifact_root}" \
+              -mindepth 1 \
+              ! -type d \
+              ! -type f \
+              -print \
+              -quit
+          )"
+
+          if [ -n "${unexpected_entry}" ]; then
+            echo "::error::The package artifact contains a non-regular entry."
+            exit 1
+          fi
+
+          mapfile -t artifact_files < <(
+            cd -- "${package_artifact_root}"
+            /usr/bin/find . -type f -printf '%P\n'
+          )
+
+          if [ "${#artifact_files[@]}" -ne 1 ] ||
+            [ "${artifact_files[0]}" != "${EXPECTED_PACKAGE_FILE}" ]; then
+            echo "::error::The package artifact does not contain the expected tarball."
+            exit 1
+          fi
+
+          package_file="${package_artifact_root}/${EXPECTED_PACKAGE_FILE}"
+          actual_sha256="$(
+            /usr/bin/sha256sum "${package_file}" |
+              /usr/bin/cut --delimiter=' ' --fields=1
+          )"
+
+          if [ "${actual_sha256}" != "${EXPECTED_PACKAGE_SHA256}" ]; then
+            echo "::error::The package tarball digest does not match preparation."
+            exit 1
+          fi
+
+      - name: Publish the validated tarball
+        run: |
+          package_file="${RUNNER_TEMP}/npm-package/${EXPECTED_PACKAGE_FILE}"
+          corepack "pnpm@${PNPM_VERSION}" publish \
+            --ignore-scripts \
+            --no-git-checks \
+            --tag "${DIST_TAG}" \
+            "${package_file}"

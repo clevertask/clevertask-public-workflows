@@ -12,11 +12,6 @@ on:
         required: false
         default: ".nvmrc"
         type: string
-      validation_script:
-        description: Caller-owned validation script relative to the repository root
-        required: false
-        default: ".github/scripts/validate-dependency-update.sh"
-        type: string
     outputs:
       changed:
         description: Whether dependency files changed
@@ -33,12 +28,17 @@ on:
 
 permissions: {}
 
+env:
+  COREPACK_VERSION: "0.34.5"
+  PNPM_VERSION: "11.17.0"
+
 concurrency:
   group: weekly-pnpm-dependency-update-${{ github.repository }}
   cancel-in-progress: false
 
 jobs:
   prepare:
+    name: Prepare and validate dependency update
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -100,15 +100,16 @@ jobs:
         env:
           NODE_VERSION_FILE: ${{ inputs.node_version_file }}
           PACKAGE_ROOTS: ${{ inputs.package_roots }}
-          VALIDATION_SCRIPT: ${{ inputs.validation_script }}
         run: |
-          repository_root="$(/usr/bin/realpath "${GITHUB_WORKSPACE}")"
+          repository_root="$(/usr/bin/realpath -- "${GITHUB_WORKSPACE}")"
 
           validate_repository_path() {
             local path="$1"
             local kind="$2"
 
-            if [[ "${path}" = /* ]] || [[ "${path}" == ".." ]] ||
+            if [[ "${path}" == *$'\r'* ]] ||
+              [[ "${path}" == *$'\n'* ]] ||
+              [[ "${path}" = /* ]] || [[ "${path}" == ".." ]] ||
               [[ "${path}" == ../* ]] || [[ "${path}" == */../* ]] ||
               [[ "${path}" == */.. ]]; then
               echo "::error::${kind} must stay inside the caller repository: ${path}"
@@ -121,7 +122,7 @@ jobs:
             fi
 
             local resolved_path
-            resolved_path="$(/usr/bin/realpath "${path}")"
+            resolved_path="$(/usr/bin/realpath -- "${path}")"
 
             case "${resolved_path}" in
               "${repository_root}" | "${repository_root}"/*) ;;
@@ -151,32 +152,77 @@ jobs:
           while IFS= read -r package_root; do
             validate_repository_path "${package_root}" "Package root"
 
-            if [ ! -f "${package_root}/package.json" ]; then
-              echo "::error::Package root has no package.json: ${package_root}"
+            if [ ! -f "${package_root}/package.json" ] ||
+              [ -L "${package_root}/package.json" ]; then
+              echo "::error::Package root must have a regular package.json: ${package_root}"
               exit 1
             fi
 
-            if [ ! -f "${package_root}/pnpm-lock.yaml" ]; then
-              echo "::error::Package root has no pnpm-lock.yaml: ${package_root}"
+            if [ ! -f "${package_root}/pnpm-lock.yaml" ] ||
+              [ -L "${package_root}/pnpm-lock.yaml" ]; then
+              echo "::error::Package root must have a regular pnpm-lock.yaml: ${package_root}"
               exit 1
             fi
 
-            resolved_package_root="$(/usr/bin/realpath "${package_root}")"
+            if [ ! -f "${package_root}/pnpm-workspace.yaml" ] ||
+              [ -L "${package_root}/pnpm-workspace.yaml" ]; then
+              echo "::error::Package root must have a regular pnpm-workspace.yaml: ${package_root}"
+              exit 1
+            fi
+
+            if ! /usr/bin/jq --exit-status '
+              (.packageManager | type) == "string" and
+              (.packageManager | startswith("pnpm@"))
+            ' "${package_root}/package.json" > /dev/null; then
+              echo "::error::${package_root}/package.json must declare pnpm in packageManager."
+              exit 1
+            fi
+
+            if ! /usr/bin/jq --exit-status '
+              (.scripts["validate:deps"] | type) == "string" and
+              (.scripts["validate:deps"] | test("\\S"))
+            ' "${package_root}/package.json" > /dev/null; then
+              echo "::error::${package_root}/package.json must define a non-empty validate:deps script."
+              exit 1
+            fi
+
+            if /usr/bin/jq --exit-status '
+              .devEngines.packageManager != null
+            ' "${package_root}/package.json" > /dev/null; then
+              echo "::error::${package_root}/package.json must not define devEngines.packageManager."
+              exit 1
+            fi
+
+            resolved_package_root="$(/usr/bin/realpath -- "${package_root}")"
 
             if [[ -n "${seen_package_roots[${resolved_package_root}]+present}" ]]; then
               echo "::error::Package roots resolve to the same directory: ${package_root}"
               exit 1
             fi
 
+            for existing_package_root in "${!seen_package_roots[@]}"; do
+              if [[ "${resolved_package_root}" == "${existing_package_root}"/* ]] ||
+                [[ "${existing_package_root}" == "${resolved_package_root}"/* ]]; then
+                echo "::error::Package roots must not overlap: ${package_root}"
+                exit 1
+              fi
+            done
+
             seen_package_roots["${resolved_package_root}"]=true
             /usr/bin/realpath \
               --relative-to="${repository_root}" \
+              -- \
               "${resolved_package_root}" \
               >> "${validated_package_roots}"
           done < "${raw_package_roots}"
 
           validate_repository_path "${NODE_VERSION_FILE}" "Node version file"
-          validate_repository_path "${VALIDATION_SCRIPT}" "Validation script"
+
+          if [ ! -f "${NODE_VERSION_FILE}" ] ||
+            [ -L "${NODE_VERSION_FILE}" ]; then
+            echo "::error::Node version file must be a regular, non-symlink file."
+            exit 1
+          fi
 
       - name: Set up Node
         if: steps.open_pull_request.outputs.skipped != 'true'
@@ -188,10 +234,10 @@ jobs:
       - name: Install Corepack and pnpm
         if: steps.open_pull_request.outputs.skipped != 'true'
         run: | # zizmor: ignore[adhoc-packages] Corepack is centrally and exactly pinned.
-          npm install --global corepack@0.34.5
+          npm install --global --ignore-scripts "corepack@${COREPACK_VERSION}"
           corepack enable
-          corepack install --global pnpm@11.17.0
-          test "$(pnpm --version)" = "11.17.0"
+          test "$(corepack --version)" = "${COREPACK_VERSION}"
+          corepack install --global "pnpm@${PNPM_VERSION}"
 
       - name: Update dependencies
         if: steps.open_pull_request.outputs.skipped != 'true'
@@ -213,36 +259,90 @@ jobs:
             echo "::group::Update ${package_root}"
 
             (
-              cd "${package_root}"
+              cd -- "${package_root}"
 
-              package_manager="$(
-                node --print "require('./package.json').packageManager ?? ''"
+              manifest_contract_json="$(
+                jq --compact-output --sort-keys '
+                  del(
+                    .packageManager,
+                    .dependencies,
+                    .devDependencies,
+                    .optionalDependencies,
+                    .peerDependencies
+                  )
+                ' package.json
               )"
 
-              if [ "${package_manager}" != "pnpm@11.17.0" ]; then
-                echo "::error::${package_root}/package.json must declare pnpm@11.17.0."
-                exit 1
-              fi
+              node --input-type=commonjs --eval '
+                const fs = require("node:fs");
 
-              pnpm_config="$(pnpm config list --json)"
-              minimum_release_age="$(
-                jq --raw-output '.minimumReleaseAge // empty' <<< "${pnpm_config}"
+                const packageJsonPath = "package.json";
+                const source = fs.readFileSync(packageJsonPath, "utf8");
+                const packageJson = JSON.parse(source);
+                const currentPackageManager = packageJson.packageManager;
+                const desiredVersion = process.env.PNPM_VERSION;
+
+                if (
+                  typeof currentPackageManager !== "string" ||
+                  !currentPackageManager.startsWith("pnpm@")
+                ) {
+                  throw new Error("packageManager must declare pnpm");
+                }
+
+                const desiredPackageManager = `pnpm@${desiredVersion}`;
+
+                if (currentPackageManager !== desiredPackageManager) {
+                  const newline = source.includes("\r\n") ? "\r\n" : "\n";
+                  const indentation =
+                    source.match(/\r?\n([ \t]+)"/)?.[1] ?? "  ";
+                  const hasFinalNewline = /\r?\n$/.test(source);
+
+                  packageJson.packageManager = desiredPackageManager;
+
+                  let updatedSource = JSON.stringify(
+                    packageJson,
+                    null,
+                    indentation,
+                  );
+
+                  if (newline === "\r\n") {
+                    updatedSource = updatedSource.replaceAll("\n", "\r\n");
+                  }
+
+                  if (hasFinalNewline) {
+                    updatedSource += newline;
+                  }
+
+                  fs.writeFileSync(packageJsonPath, updatedSource);
+                }
+              '
+
+              test "$(pnpm --version)" = "${PNPM_VERSION}"
+
+              pnpm_config="$(
+                corepack "pnpm@${PNPM_VERSION}" config list --json
               )"
 
-              if [ "${minimum_release_age}" != "4320" ]; then
+              if ! jq --exit-status '
+                (.minimumReleaseAge | type) == "number" and
+                .minimumReleaseAge == 4320
+              ' <<< "${pnpm_config}" > /dev/null; then
                 echo "::error::${package_root}/pnpm-workspace.yaml must set minimumReleaseAge: 4320."
                 exit 1
               fi
 
               if ! jq --exit-status '
-                (.updateConfig.ignoreDependencies // []) |
-                index("@types/node") != null
+                (.updateConfig.ignoreDependencies | type) == "array" and
+                (
+                  .updateConfig.ignoreDependencies |
+                  index("@types/node") != null
+                )
               ' <<< "${pnpm_config}" > /dev/null; then
                 echo "::error::${package_root}/pnpm-workspace.yaml must ignore @types/node during latest updates."
                 exit 1
               fi
 
-              pnpm up --latest
+              corepack "pnpm@${PNPM_VERSION}" up --latest
 
               if node --eval '
                 const packageJson = require("./package.json");
@@ -256,7 +356,10 @@ jobs:
                 );
                 process.exit(hasNodeTypes ? 0 : 1);
               '; then
-                pnpm up "@types/node@${node_major}"
+                corepack \
+                  "pnpm@${PNPM_VERSION}" \
+                  up \
+                  "@types/node@${node_major}"
 
                 installed_node_types_major="$(
                   node --print \
@@ -267,6 +370,31 @@ jobs:
                   echo "::error::@types/node does not match Node ${node_major} in ${package_root}."
                   exit 1
                 fi
+              fi
+
+              updated_package_manager="$(
+                node --print "require('./package.json').packageManager"
+              )"
+              updated_manifest_contract_json="$(
+                jq --compact-output --sort-keys '
+                  del(
+                    .packageManager,
+                    .dependencies,
+                    .devDependencies,
+                    .optionalDependencies,
+                    .peerDependencies
+                  )
+                ' package.json
+              )"
+
+              if [ "${updated_package_manager}" != "pnpm@${PNPM_VERSION}" ]; then
+                echo "::error::The dependency update changed packageManager in ${package_root}."
+                exit 1
+              fi
+
+              if [ "${updated_manifest_contract_json}" != "${manifest_contract_json}" ]; then
+                echo "::error::The dependency update changed non-dependency package fields in ${package_root}."
+                exit 1
               fi
             )
 
@@ -304,11 +432,13 @@ jobs:
             package_manifest="$(
               /usr/bin/realpath \
                 --relative-to="${GITHUB_WORKSPACE}" \
+                -- \
                 "${package_root}/package.json"
             )"
             lockfile="$(
               /usr/bin/realpath \
                 --relative-to="${GITHUB_WORKSPACE}" \
+                -- \
                 "${package_root}/pnpm-lock.yaml"
             )"
             printf '%s\n' "${package_manifest}" "${lockfile}" >> "${allowed_paths}"
@@ -372,6 +502,7 @@ jobs:
           /usr/bin/git config user.email "github-actions@clevertask.ai"
           /usr/bin/git \
             -c core.hooksPath=/dev/null \
+            -c commit.gpgsign=false \
             commit \
             --no-verify \
             --message "chore(deps): validate dependency snapshot"
@@ -389,25 +520,40 @@ jobs:
       - name: Verify the dependency snapshot upload
         if: steps.changes.outputs.changed == 'true'
         env:
+          ARTIFACT_DIGEST: ${{ steps.dependency_snapshot.outputs.artifact-digest }}
           ARTIFACT_ID: ${{ steps.dependency_snapshot.outputs.artifact-id }}
-        run: test -n "${ARTIFACT_ID}"
+        run: |
+          if [[ ! "${ARTIFACT_ID}" =~ ^[0-9]+$ ]] ||
+            [[ ! "${ARTIFACT_DIGEST}" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::The dependency upload returned invalid artifact metadata."
+            exit 1
+          fi
 
       - name: Run caller validation
         id: validation
         if: steps.changes.outputs.changed == 'true'
         continue-on-error: true
-        env:
-          VALIDATION_SCRIPT: ${{ inputs.validation_script }}
         run: |
-          /usr/bin/bash "${VALIDATION_SCRIPT}"
+          while IFS= read -r package_root; do
+            echo "::group::Validate ${package_root}"
 
-          if [ -n "$(/usr/bin/git status --porcelain)" ]; then
-            echo "::error::The validation script left the repository dirty."
-            /usr/bin/git status --short
-            exit 1
-          fi
+            (
+              cd -- "${package_root}"
+              corepack "pnpm@${PNPM_VERSION}" install --frozen-lockfile
+              corepack "pnpm@${PNPM_VERSION}" run validate:deps
+            )
+
+            if [ -n "$(/usr/bin/git status --porcelain)" ]; then
+              echo "::error::validate:deps left the repository dirty after ${package_root}."
+              /usr/bin/git status --short
+              exit 1
+            fi
+
+            echo "::endgroup::"
+          done < "${RUNNER_TEMP}/dependency-update-package-roots"
 
   publish:
+    name: Publish dependency update pull request
     needs: prepare
     if: >-
       needs.prepare.result == 'success' &&
@@ -481,7 +627,6 @@ jobs:
         with:
           artifact-ids: ${{ needs.prepare.outputs.artifact_id }}
           digest-mismatch: error
-          merge-multiple: true
           path: ${{ runner.temp }}/dependency-update-artifact
 
       - name: Validate and apply the dependency snapshot
@@ -489,7 +634,7 @@ jobs:
         env:
           PACKAGE_ROOTS: ${{ inputs.package_roots }}
         run: |
-          repository_root="$(/usr/bin/realpath "${GITHUB_WORKSPACE}")"
+          repository_root="$(/usr/bin/realpath -- "${GITHUB_WORKSPACE}")"
           artifact_root="${RUNNER_TEMP}/dependency-update-artifact"
           allowed_paths="${RUNNER_TEMP}/dependency-update-allowed-paths"
           artifact_paths="${RUNNER_TEMP}/dependency-update-artifact-paths"
@@ -500,9 +645,10 @@ jobs:
           if ! /usr/bin/jq --exit-status '
             type == "array" and
             length > 0 and
-            all(.[]; type == "string" and length > 0 and (test("[\\r\\n]") | not))
+            all(.[]; type == "string" and length > 0 and (test("[\\r\\n]") | not)) and
+            (unique | length) == length
           ' <<< "${PACKAGE_ROOTS}" > /dev/null; then
-            echo '::error::package_roots must be a non-empty JSON array of paths.'
+            echo '::error::package_roots must be a non-empty JSON array of unique paths.'
             exit 1
           fi
 
@@ -522,7 +668,7 @@ jobs:
               exit 1
             fi
 
-            resolved_package_root="$(/usr/bin/realpath "${package_root}")"
+            resolved_package_root="$(/usr/bin/realpath -- "${package_root}")"
 
             case "${resolved_package_root}" in
               "${repository_root}" | "${repository_root}"/*) ;;
@@ -537,10 +683,19 @@ jobs:
               exit 1
             fi
 
+            for existing_package_root in "${!seen_package_roots[@]}"; do
+              if [[ "${resolved_package_root}" == "${existing_package_root}"/* ]] ||
+                [[ "${existing_package_root}" == "${resolved_package_root}"/* ]]; then
+                echo "::error::Package roots must not overlap: ${package_root}"
+                exit 1
+              fi
+            done
+
             seen_package_roots["${resolved_package_root}"]=true
             normalized_package_root="$(
               /usr/bin/realpath \
                 --relative-to="${repository_root}" \
+                -- \
                 "${resolved_package_root}"
             )"
             printf '%s\n' "${normalized_package_root}" >> "${validated_package_roots}"
@@ -568,7 +723,7 @@ jobs:
           fi
 
           (
-            cd "${artifact_root}"
+            cd -- "${artifact_root}"
             /usr/bin/find . -type f -printf '%P\n' | /usr/bin/sort --unique
           ) > "${artifact_paths}"
 
@@ -584,6 +739,55 @@ jobs:
             if [ ! -f "${artifact_file}" ] || [ -L "${artifact_file}" ]; then
               echo "::error::Dependency artifact must contain a regular file: ${allowed_path}"
               exit 1
+            fi
+
+            if [[ "${allowed_path}" == "package.json" ]] ||
+              [[ "${allowed_path}" == */package.json ]]; then
+              if ! /usr/bin/jq \
+                --exit-status \
+                --arg expected_package_manager "pnpm@${PNPM_VERSION}" \
+                '
+                  .packageManager == $expected_package_manager and
+                  (.scripts["validate:deps"] | type) == "string" and
+                  (.scripts["validate:deps"] | test("\\S")) and
+                  .devEngines.packageManager == null
+                ' \
+                "${artifact_file}" > /dev/null; then
+                echo "::error::Dependency artifact has an invalid package contract: ${allowed_path}"
+                exit 1
+              fi
+
+              original_manifest_contract_json="$(
+                /usr/bin/jq --compact-output --sort-keys \
+                  '
+                    del(
+                      .packageManager,
+                      .dependencies,
+                      .devDependencies,
+                      .optionalDependencies,
+                      .peerDependencies
+                    )
+                  ' \
+                  "${destination}"
+              )"
+              artifact_manifest_contract_json="$(
+                /usr/bin/jq --compact-output --sort-keys \
+                  '
+                    del(
+                      .packageManager,
+                      .dependencies,
+                      .devDependencies,
+                      .optionalDependencies,
+                      .peerDependencies
+                    )
+                  ' \
+                  "${artifact_file}"
+              )"
+
+              if [ "${artifact_manifest_contract_json}" != "${original_manifest_contract_json}" ]; then
+                echo "::error::Dependency artifact changed non-dependency package fields: ${allowed_path}"
+                exit 1
+              fi
             fi
 
             /usr/bin/cp \
@@ -643,6 +847,7 @@ jobs:
           /usr/bin/git diff --cached --check
           /usr/bin/git \
             -c core.hooksPath=/dev/null \
+            -c commit.gpgsign=false \
             commit \
             --no-verify \
             --message "chore(deps): update dependencies"
@@ -681,6 +886,7 @@ jobs:
             echo "## What changed"
             echo
             echo "- Ran \`pnpm up --latest\` in every configured package root."
+            echo "- Synchronized \`packageManager\` to \`pnpm@${PNPM_VERSION}\`."
             echo "- Kept direct \`@types/node\` dependencies on the active Node LTS major."
             echo "- Regenerated the affected pnpm lockfiles."
             echo
@@ -692,7 +898,7 @@ jobs:
             echo
             echo "## Not included"
             echo
-            echo "This automation does not merge, publish, deploy, or update pnpm, Corepack, or GitHub Action references."
+            echo "This automation does not merge, publish, deploy, or update the shared pnpm pin, Corepack pin, or GitHub Action references."
           } > "${RUNNER_TEMP}/dependency-update-pr.md"
 
           pull_request_url="$(
@@ -707,6 +913,7 @@ jobs:
           echo "url=${pull_request_url}" >> "${GITHUB_OUTPUT}"
 
   report_validation_failure:
+    name: Report dependency validation failure
     needs:
       - prepare
       - publish

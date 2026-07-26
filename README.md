@@ -19,14 +19,25 @@ automation for public/open-source repos that we want to maintain in one place.
 - Local wrappers keep stable workflow filenames for npm trusted publishing and
   repo-specific conventions.
 - Dependency-update wrappers also own their schedules, permissions, package
-  roots, and repository-specific validation. They consume the shared workflow
-  by an immutable commit SHA and do not pass inherited secrets.
-- Dependency and validation code runs in a read-only job. A fresh job receives
-  only allowlisted manifests and lockfiles before it gets write permission.
-- Shared workflows install exact `corepack@0.34.5`, select exact
-  `pnpm@11.17.0`, and verify the active pnpm version before running package
-  commands. The dependency updater also verifies that every package root
-  declares the same pnpm version.
+  roots, and repository-specific `validate:deps` commands. They consume the
+  shared workflow by an immutable commit SHA and do not pass inherited secrets.
+- Dependency and validation code runs in a read-only job. A fresh write-capable
+  job independently verifies only allowlisted manifests and lockfiles and never
+  executes package code.
+- npm package builds and lifecycle checks run without an OIDC token. A fresh
+  publish job verifies one packed tarball and publishes it with lifecycle
+  scripts disabled.
+- Release versioning disables package scripts and Git hooks, permits only the
+  package manifest and optional lockfile to change, and receives the PAT only
+  for remote release writes.
+- Shared workflows install exact `corepack@0.34.5`. Publish and release
+  workflows select the exact pnpm version declared by `packageManager`; the
+  dependency updater centrally pins `pnpm@11.17.0` and synchronizes every
+  configured package root to it.
+- Dependabot owns the `github-actions` ecosystem in this repository. Consumer
+  repositories use the same wiring so third-party Actions and immutable
+  reusable-workflow references stay current without handing npm manifests or
+  pnpm lockfiles to Dependabot.
 
 ## Current Consumers
 

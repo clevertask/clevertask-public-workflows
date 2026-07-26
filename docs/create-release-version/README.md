@@ -18,15 +18,31 @@ the repository, pushing the commit/tag, and creating a GitHub release.
 ## Required Secrets
 
 - `github_pat`:
-  Personal access token used for checkout, push, and GitHub release creation.
+  Personal access token used to push the version commit and tag, then create
+  the GitHub release.
 
 ## Notes
 
-- This workflow installs exact `corepack@0.34.5`, selects exact
-  `pnpm@11.17.0`, and verifies the active pnpm version from the package
-  directory before changing package metadata.
-- It does not install dependencies; its pnpm step only bumps package metadata
-  and an optional lockfile before the Git and GitHub release operations.
+- This workflow installs exact `corepack@0.34.5`, selects and verifies the
+  exact pnpm version declared by the package's `packageManager`, and then
+  changes package metadata.
+- `packageManager` is the only package-manager declaration;
+  `devEngines.packageManager` must not be set.
+- It validates the working directory and Node version file before toolchain
+  setup and does not install dependencies.
+- Versioning disables `preversion`, `version`, and `postversion` scripts. Git
+  hooks are disabled for the commit and push.
+- Only `package.json` and an optional `pnpm-lock.yaml` may change. The workflow
+  verifies the requested version, unchanged package-manager declaration,
+  staged paths, committed paths, and a clean worktree.
+- Checkout credentials are not persisted. The PAT is exposed only to the push
+  and GitHub-release steps.
+- Releases must run from a branch. The version commit and tag are pushed
+  atomically before the GitHub release is created.
+- A rerun checks out the current branch head. If the atomic push succeeded but
+  GitHub release creation failed, the workflow verifies that the existing tag,
+  branch head, and package version agree, then resumes at release creation. If
+  the GitHub release already exists, the rerun exits successfully.
 
 ## Example
 
@@ -47,11 +63,11 @@ on:
         type: boolean
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   release:
-    uses: clevertask/clevertask-public-workflows/.github/workflows/create-release-version.yml@main
+    uses: clevertask/clevertask-public-workflows/.github/workflows/create-release-version.yml@<FULL_COMMIT_SHA>
     with:
       version: ${{ inputs.version }}
       prerelease: ${{ inputs.prerelease }}
