@@ -29,7 +29,8 @@ automation for public/open-source repos that we want to maintain in one place.
   scripts disabled.
 - Release versioning disables package scripts and Git hooks, permits only the
   package manifest and optional lockfile to change, and receives the PAT only
-  for remote release writes.
+  for remote release writes. Release and publish workflows support SemVer
+  prereleases but reject build metadata that pnpm would remove.
 - Shared workflows install exact `corepack@0.34.5`. Publish and release
   workflows select the exact pnpm version declared by `packageManager`; the
   dependency updater centrally pins `pnpm@11.17.0` and synchronizes every

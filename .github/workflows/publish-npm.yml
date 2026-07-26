@@ -83,6 +83,20 @@ jobs:
               ;;
           esac
 
+          package_version="$(
+            /usr/bin/jq \
+              --raw-output \
+              'if (.version | type) == "string" then .version else "" end' \
+              -- \
+              "${resolved_working_directory}/package.json"
+          )"
+          supported_version_pattern='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*))?$'
+
+          if [[ ! "${package_version}" =~ ${supported_version_pattern} ]]; then
+            echo "::error::package.json version must be semantic and must not contain build metadata."
+            exit 1
+          fi
+
           if [[ "${NODE_VERSION_FILE}" == *$'\r'* ]] ||
             [[ "${NODE_VERSION_FILE}" == *$'\n'* ]] ||
             [[ "${NODE_VERSION_FILE}" = /* ]] ||

@@ -22,6 +22,9 @@ Reusable workflow for publishing a pnpm-based package to npm.
   `--frozen-lockfile`.
 - `packageManager` is the only package-manager declaration;
   `devEngines.packageManager` must not be set.
+- The source package version may use SemVer prerelease identifiers such as
+  `-alpha.1` or `-beta.1`. Build metadata such as `+build.7` is rejected before
+  packing because pnpm removes it from the published package version.
 - A read-only preparation job runs formatting, the build, `prepublishOnly` when
   present, and `pnpm pack`. Package lifecycle code has no npm OIDC token.
 - Only the resulting tarball crosses into a fresh OIDC-enabled job. That job

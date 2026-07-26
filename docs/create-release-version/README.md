@@ -6,7 +6,8 @@ the repository, pushing the commit/tag, and creating a GitHub release.
 ## Inputs
 
 - `version`:
-  Version to release, for example `0.1.0` or `1.0.0-alpha.0`.
+  Version to release, for example `0.1.0`, `1.0.0-alpha.1`, or
+  `1.0.0-beta.1`.
 - `prerelease`:
   When `true`, the GitHub release is marked as a prerelease.
 - `working_directory`:
@@ -32,6 +33,10 @@ the repository, pushing the commit/tag, and creating a GitHub release.
   setup and does not install dependencies.
 - Versioning disables `preversion`, `version`, and `postversion` scripts. Git
   hooks are disabled for the commit and push.
+- Versions may use SemVer prerelease identifiers such as `-alpha.1` or
+  `-beta.1`. A leading `v` and SemVer build metadata such as `+build.7` are
+  rejected because the pinned pnpm release and packing path does not preserve
+  build metadata.
 - Only `package.json` and an optional `pnpm-lock.yaml` may change. The workflow
   verifies the requested version, unchanged package-manager declaration,
   staged paths, committed paths, and a clean worktree.
