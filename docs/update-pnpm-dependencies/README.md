@@ -102,9 +102,10 @@ The workflow:
     and lockfiles;
 13. uses the fresh write-capable job to push the unique branch and open the
     draft pull request only after the snapshot passes independent checks;
-14. uses a separate permissionless job and only the explicitly mapped
-    `review_token` to request review from the optional configured organization
-    team without checking out or executing package code; and
+14. uses a separate read-only job to inspect review history with `GITHUB_TOKEN`
+    and only the explicitly mapped `review_token` to submit a request for the
+    optional configured organization team, without checking out or executing
+    package code; and
 15. uses a separate permissionless job to fail the workflow when validation
     failed.
 
@@ -116,16 +117,16 @@ dependency changes remain available for diagnosis.
 When the default branch moves during preparation, rerun the full workflow so a
 new snapshot is built from the current base.
 
-Dependency preparation and pull-request publishing use the caller's
-`GITHUB_TOKEN`. Team notification uses only the explicitly mapped
-`review_token`; callers must not use `secrets: inherit`. The schedule or manual
-validation run belongs to the default-branch event rather than the new PR head,
-so the draft PR body links to that run. Separate pull-request checks on a
-bot-created PR can require manual approval from a repository writer under the
-caller's contributor-approval policy. Requesting a review team provides a human
-notification and review target; it does not approve pending Actions runs. A
-narrowly scoped GitHub App can replace the token later if manual approval
-becomes too costly.
+Dependency preparation, pull-request publishing, and team-review history reads
+use the caller's `GITHUB_TOKEN`. The notification job uses the explicitly
+mapped `review_token` only to submit the team-review request; callers must not
+use `secrets: inherit`. The schedule or manual validation run belongs to the
+default-branch event rather than the new PR head, so the draft PR body links to
+that run. Separate pull-request checks on a bot-created PR can require manual
+approval from a repository writer under the caller's contributor-approval
+policy. Requesting a review team provides a human notification and review
+target; it does not approve pending Actions runs. A narrowly scoped GitHub App
+can replace the token later if manual approval becomes too costly.
 
 Team notification is retried when a later run finds an existing automation pull
 request with no historical request for that team. A matching team is notified

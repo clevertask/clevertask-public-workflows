@@ -946,18 +946,20 @@ jobs:
         needs.publish.outputs.pull_request_url != ''
       )
     runs-on: ubuntu-latest
-    permissions: {}
+    permissions:
+      pull-requests: read # Inspect the existing review history with GITHUB_TOKEN.
     defaults:
       run:
         shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
     steps:
       - name: Request review
         env:
-          GH_TOKEN: ${{ secrets.review_token }}
+          GH_TOKEN: ${{ github.token }}
           PULL_REQUEST_URL: ${{ needs.publish.outputs.pull_request_url || needs.prepare.outputs.pull_request_url }}
           REVIEW_TEAM: ${{ inputs.review_team }}
+          REVIEW_TOKEN: ${{ secrets.review_token }}
         run: |
-          if [ -z "${GH_TOKEN}" ]; then
+          if [ -z "${REVIEW_TOKEN}" ]; then
             echo "::error::review_token is required when review_team is configured and a dependency-update pull request needs review."
             exit 1
           fi
@@ -1025,7 +1027,7 @@ jobs:
             -- "${review_target}" <<< "${requested_teams}" > /dev/null; then
             echo "Review was already requested from ${review_target}."
           else
-            gh api \
+            GH_TOKEN="${REVIEW_TOKEN}" gh api \
               --method POST \
               "repos/${GITHUB_REPOSITORY}/pulls/${pull_request_number}/requested_reviewers" \
               -f "team_reviewers[]=${REVIEW_TEAM}" \
