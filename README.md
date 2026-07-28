@@ -20,7 +20,9 @@ automation for public/open-source repos that we want to maintain in one place.
   repo-specific conventions.
 - Dependency-update wrappers also own their schedules, permissions, package
   roots, and repository-specific `validate:deps` commands. They consume the
-  shared workflow by an immutable commit SHA and do not pass inherited secrets.
+  shared workflow by an immutable commit SHA, can optionally request review
+  from one team in the caller repository's organization, and do not pass
+  inherited secrets.
 - Dependency and validation code runs in a read-only job. A fresh write-capable
   job independently verifies only allowlisted manifests and lockfiles and never
   executes package code.

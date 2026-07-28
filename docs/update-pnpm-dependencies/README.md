@@ -11,6 +11,10 @@ request in the caller repository.
   `["client","server","mcp"]` for independent package roots.
 - `node_version_file`:
   Node version file relative to the caller repository. Defaults to `.nvmrc`.
+- `review_team`:
+  Optional GitHub team slug in the caller repository's organization to request
+  review from on the dependency-update draft pull request. Pass the slug only,
+  such as `dependency-reviewers`, rather than `organization/team`.
 
 Paths must exist inside the caller repository. Package roots must be unique,
 must not overlap, and must contain regular, non-symlink `package.json`,
@@ -32,6 +36,11 @@ The caller repository must:
 The shared workflow synchronizes every `packageManager` field to its centrally
 pinned pnpm version. Other caller workflows should install the exact pnpm
 version from `packageManager` instead of repeating it elsewhere.
+
+When `review_team` is configured, the team must be visible, have notifications
+enabled, and have at least read access to the caller repository. The initial
+CleverTask team is `clevertask/dependency-reviewers`, with automatic member
+assignment disabled while the rollout is being tested.
 
 `validate:deps` must be non-interactive, exit nonzero on failure, and leave the
 Git worktree clean. It should run the repository's formatting check, linter,
@@ -85,8 +94,11 @@ The workflow:
     and non-dependency package field, and applies only the configured manifests
     and lockfiles;
 13. uses the fresh write-capable job to push the unique branch and open the
-    draft pull request only after the snapshot passes independent checks; and
-14. uses a separate permissionless job to fail the workflow when validation
+    draft pull request only after the snapshot passes independent checks;
+14. uses a separate job with only `pull-requests: write` to request review from
+    the optional configured organization team without checking out or executing
+    package code; and
+15. uses a separate permissionless job to fail the workflow when validation
     failed.
 
 Input, setup, or dependency-resolution failures happen before a reviewable
@@ -100,9 +112,20 @@ new snapshot is built from the current base.
 The workflow uses only the caller's `GITHUB_TOKEN`; callers must not use
 `secrets: inherit`. The schedule or manual validation run belongs to the
 default-branch event rather than the new PR head, so the draft PR body links to
-that run. Separate pull-request checks triggered by the token require manual
-approval from a repository writer. A narrowly scoped GitHub App can replace
-this later if manual approval becomes too costly.
+that run. Separate pull-request checks on a bot-created PR can require manual
+approval from a repository writer under the caller's contributor-approval
+policy. Requesting a review team provides a human notification and review
+target; it does not approve pending Actions runs. A narrowly scoped GitHub App
+can replace the token later if manual approval becomes too costly.
+
+Team notification is retried when a later run finds an existing automation pull
+request with no historical request for that team. A matching team is notified
+at most once per pull request, including after a member reviews, GitHub assigns
+specific members, or someone removes the request. A human can re-request review
+when needed, and a cancelled run does not request review. An invalid team slug
+fails before dependency work begins. A valid-looking but unavailable team or a
+failed GitHub review request fails the notification job but leaves the draft
+pull request available for review and retry.
 
 The read-only and write-capable jobs are intentionally isolated. GitHub grants
 permissions at job scope, so the publish job is write-capable from its start;
@@ -146,6 +169,7 @@ jobs:
     uses: clevertask/clevertask-public-workflows/.github/workflows/update-pnpm-dependencies.yml@<FULL_COMMIT_SHA>
     with:
       package_roots: '["."]'
+      review_team: dependency-reviewers
 ```
 
 Do not add automatic merge, publish, or deploy steps to this wrapper. The draft

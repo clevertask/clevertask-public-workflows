@@ -12,6 +12,11 @@ on:
         required: false
         default: ".nvmrc"
         type: string
+      review_team:
+        description: GitHub team slug in the caller repository organization to request review from
+        required: false
+        default: ""
+        type: string
     outputs:
       changed:
         description: Whether dependency files changed
@@ -65,6 +70,16 @@ jobs:
       - name: Record the update base
         id: base
         run: echo "sha=$(/usr/bin/git rev-parse HEAD)" >> "${GITHUB_OUTPUT}"
+
+      - name: Validate review team input
+        env:
+          REVIEW_TEAM: ${{ inputs.review_team }}
+        run: |
+          if [ -n "${REVIEW_TEAM}" ] &&
+            [[ ! "${REVIEW_TEAM}" =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]]; then
+            echo "::error::review_team must be one canonical GitHub team slug."
+            exit 1
+          fi
 
       - name: Skip while an automation pull request is open
         id: open_pull_request
@@ -911,6 +926,103 @@ jobs:
           )"
 
           echo "url=${pull_request_url}" >> "${GITHUB_OUTPUT}"
+
+  request_review:
+    name: Request dependency update team review
+    needs:
+      - prepare
+      - publish
+    if: >-
+      always() &&
+      !cancelled() &&
+      inputs.review_team != '' &&
+      needs.prepare.result == 'success' &&
+      (
+        needs.prepare.outputs.pull_request_url != '' ||
+        needs.publish.outputs.pull_request_url != ''
+      )
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write # Request review without checking out or executing package code.
+    defaults:
+      run:
+        shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+    steps:
+      - name: Request review
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PULL_REQUEST_URL: ${{ needs.publish.outputs.pull_request_url || needs.prepare.outputs.pull_request_url }}
+          REVIEW_TEAM: ${{ inputs.review_team }}
+        run: |
+          pull_request_number="$(
+            gh pr view "${PULL_REQUEST_URL}" --json number --jq '.number'
+          )"
+          repository_owner="${GITHUB_REPOSITORY%%/*}"
+          repository_name="${GITHUB_REPOSITORY#*/}"
+          review_target="${repository_owner}/${REVIEW_TEAM}"
+
+          requested_teams="$(
+            gh api graphql \
+              --paginate \
+              -f query='
+                query(
+                  $owner: String!
+                  $name: String!
+                  $number: Int!
+                  $endCursor: String
+                ) {
+                  repository(owner: $owner, name: $name) {
+                    pullRequest(number: $number) {
+                      timelineItems(
+                        first: 100
+                        after: $endCursor
+                        itemTypes: [REVIEW_REQUESTED_EVENT]
+                      ) {
+                        nodes {
+                          ... on ReviewRequestedEvent {
+                            requestedReviewer {
+                              __typename
+                              ... on Team {
+                                slug
+                                organization {
+                                  login
+                                }
+                              }
+                            }
+                          }
+                        }
+                        pageInfo {
+                          hasNextPage
+                          endCursor
+                        }
+                      }
+                    }
+                  }
+                }
+              ' \
+              -F owner="${repository_owner}" \
+              -F name="${repository_name}" \
+              -F number="${pull_request_number}" \
+              --jq '
+                .data.repository.pullRequest.timelineItems.nodes[]
+                | .requestedReviewer
+                | select(.__typename == "Team")
+                | "\(.organization.login)/\(.slug)"
+              '
+          )"
+
+          if /usr/bin/grep \
+            --fixed-strings \
+            --line-regexp \
+            -- "${review_target}" <<< "${requested_teams}" > /dev/null; then
+            echo "Review was already requested from ${review_target}."
+          else
+            gh api \
+              --method POST \
+              "repos/${GITHUB_REPOSITORY}/pulls/${pull_request_number}/requested_reviewers" \
+              -f "team_reviewers[]=${REVIEW_TEAM}" \
+              --silent
+          fi
 
   report_validation_failure:
     name: Report dependency validation failure
