@@ -12,6 +12,11 @@ on:
         required: false
         default: ".nvmrc"
         type: string
+      reviewer:
+        description: GitHub username to request review from on the dependency-update pull request
+        required: false
+        default: ""
+        type: string
     outputs:
       changed:
         description: Whether dependency files changed
@@ -65,6 +70,19 @@ jobs:
       - name: Record the update base
         id: base
         run: echo "sha=$(/usr/bin/git rev-parse HEAD)" >> "${GITHUB_OUTPUT}"
+
+      - name: Validate reviewer input
+        env:
+          REVIEWER: ${{ inputs.reviewer }}
+        run: |
+          if [ -n "${REVIEWER}" ] &&
+            {
+              [[ ! "${REVIEWER}" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,37}[A-Za-z0-9])?$ ]] ||
+                [[ "${REVIEWER}" == *--* ]]
+            }; then
+            echo "::error::reviewer must be one valid GitHub username."
+            exit 1
+          fi
 
       - name: Skip while an automation pull request is open
         id: open_pull_request
@@ -911,6 +929,51 @@ jobs:
           )"
 
           echo "url=${pull_request_url}" >> "${GITHUB_OUTPUT}"
+
+  request_review:
+    name: Request dependency update review
+    needs:
+      - prepare
+      - publish
+    if: >-
+      always() &&
+      inputs.reviewer != '' &&
+      needs.prepare.result == 'success' &&
+      (
+        needs.prepare.outputs.pull_request_url != '' ||
+        needs.publish.outputs.pull_request_url != ''
+      )
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write # Request review without checking out or executing package code.
+    defaults:
+      run:
+        shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+    steps:
+      - name: Request review
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PULL_REQUEST_URL: ${{ needs.publish.outputs.pull_request_url || needs.prepare.outputs.pull_request_url }}
+          REVIEWER: ${{ inputs.reviewer }}
+        run: |
+          reviewer_activity="$(
+            gh pr view \
+              "${PULL_REQUEST_URL}" \
+              --json reviewRequests,reviews \
+              --jq '([.reviewRequests[].login] + [.reviews[].author.login])[]'
+          )"
+
+          if /usr/bin/grep \
+            --fixed-strings \
+            --ignore-case \
+            --line-regexp \
+            -- "${REVIEWER}" <<< "${reviewer_activity}" > /dev/null; then
+            echo "Review is already requested from or completed by ${REVIEWER}."
+          else
+            gh pr edit \
+              "${PULL_REQUEST_URL}" \
+              --add-reviewer "${REVIEWER}"
+          fi
 
   report_validation_failure:
     name: Report dependency validation failure
