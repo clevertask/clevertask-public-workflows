@@ -17,6 +17,10 @@ on:
         required: false
         default: ""
         type: string
+    secrets:
+      review_token:
+        description: Token used only to request the configured review team
+        required: false
     outputs:
       changed:
         description: Whether dependency files changed
@@ -942,18 +946,22 @@ jobs:
         needs.publish.outputs.pull_request_url != ''
       )
     runs-on: ubuntu-latest
-    permissions:
-      pull-requests: write # Request review without checking out or executing package code.
+    permissions: {}
     defaults:
       run:
         shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
     steps:
       - name: Request review
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.review_token }}
           PULL_REQUEST_URL: ${{ needs.publish.outputs.pull_request_url || needs.prepare.outputs.pull_request_url }}
           REVIEW_TEAM: ${{ inputs.review_team }}
         run: |
+          if [ -z "${GH_TOKEN}" ]; then
+            echo "::error::review_token is required when review_team is configured and a dependency-update pull request needs review."
+            exit 1
+          fi
+
           pull_request_number="$(
             gh pr view "${PULL_REQUEST_URL}" --json number --jq '.number'
           )"
