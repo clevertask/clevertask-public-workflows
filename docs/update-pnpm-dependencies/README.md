@@ -37,6 +37,11 @@ The caller repository must:
 - omit `devEngines.packageManager` so it cannot conflict with the synchronized
   `packageManager`;
 - define a non-empty `validate:deps` script in every configured package root;
+- when repository-specific dependency alignment is required, optionally define
+  a non-empty `dependency-update:post` script that is safe to run without
+  credentials and changes only dependency fields in the package manifest and
+  its pnpm lockfile, without changing a direct `@types/node` declaration owned
+  by the shared workflow;
 - keep a Node LTS selector in the configured Node version file;
 - configure update policy in each package root's `pnpm-workspace.yaml`.
 
@@ -88,29 +93,35 @@ The workflow:
 5. synchronizes every `packageManager` field to `pnpm@11.17.0` and runs
    `pnpm up --latest` sequentially in every package root;
 6. updates direct `@types/node` dependencies within the active Node LTS major;
-7. rejects changes to scripts or any other non-dependency package fields
-   besides the intentional `packageManager` synchronization;
-8. exits successfully without an artifact or branch when dependencies did not
+7. verifies non-dependency fields are unchanged and, when it was declared on
+   the checked-out base, runs the fixed `dependency-update:post` package script
+   through the pinned pnpm version with automatic pre/post lifecycle scripts
+   disabled, rejects changes to the centrally synchronized direct `@types/node`
+   declaration, then reconciles the lockfile without running lifecycle scripts;
+8. rejects post-update changes to scripts or any other non-dependency package
+   fields besides the intentional `packageManager` synchronization;
+9. exits successfully without an artifact or branch when dependencies did not
    change;
-9. snapshots only package manifests and pnpm lockfiles into one immutable
+10. snapshots only package manifests and pnpm lockfiles into one immutable
    artifact;
-10. performs a frozen install and runs `validate:deps` in every package root;
-11. starts a fresh write-capable job, checks out the exact recorded SHA, and
-   stops if the default branch moved or another automation PR appeared;
-12. downloads the snapshot by artifact ID, independently verifies every path
+11. performs a frozen install and runs `validate:deps` in every package root;
+12. starts a fresh write-capable job, checks out the exact recorded SHA, and
+    stops if the default branch moved or another automation PR appeared;
+13. downloads the snapshot by artifact ID, independently verifies every path
     and non-dependency package field, and applies only the configured manifests
     and lockfiles;
-13. uses the fresh write-capable job to push the unique branch and open the
+14. uses the fresh write-capable job to push the unique branch and open the
     draft pull request only after the snapshot passes independent checks;
-14. uses a separate read-only job to inspect review history with `GITHUB_TOKEN`
+15. uses a separate read-only job to inspect review history with `GITHUB_TOKEN`
     and only the explicitly mapped `review_token` to submit a request for the
     optional configured organization team, without checking out or executing
     package code; and
-15. uses a separate permissionless job to fail the workflow when validation
+16. uses a separate permissionless job to fail the workflow when validation
     failed.
 
-Input, setup, or dependency-resolution failures happen before a reviewable
-commit exists, so they fail the workflow without opening a pull request.
+Input, setup, dependency-resolution, or `dependency-update:post` failures happen
+before a reviewable commit exists, so they fail the workflow without opening a
+pull request.
 When `validate:deps` fails after a snapshot exists, the workflow still opens
 the draft pull request with a failure note, then fails the run so the proposed
 dependency changes remain available for diagnosis.
@@ -139,11 +150,16 @@ job but leaves the draft pull request available for review and retry.
 
 The read-only and write-capable jobs are intentionally isolated. GitHub grants
 permissions at job scope, so the publish job is write-capable from its start;
-package lifecycle and validation code never run there. The artifact is treated
-as untrusted input: the publish job downloads it by immutable ID, checks its
-digest through `actions/download-artifact`, rejects non-regular or unexpected
-paths, and never executes code from it. Checkout credentials are not persisted,
-and Git or GitHub CLI write operations happen only after these checks pass.
+the optional post-update script, package lifecycle code, and validation code
+never run there. The workflow invokes only the fixed `dependency-update:post`
+script that already existed on the checked-out base; it does not accept a shell
+command as input, and pnpm's automatic `predependency-update:post` and
+`postdependency-update:post` lifecycle scripts are disabled for the invocation.
+The artifact is treated as untrusted input: the publish job downloads it by
+immutable ID, checks its digest through
+`actions/download-artifact`, rejects non-regular or unexpected paths, and never
+executes code from it. Checkout credentials are not persisted, and Git or
+GitHub CLI write operations happen only after these checks pass.
 
 ## Outputs
 
