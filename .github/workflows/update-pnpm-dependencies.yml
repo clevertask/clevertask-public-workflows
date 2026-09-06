@@ -206,6 +206,17 @@ jobs:
             fi
 
             if /usr/bin/jq --exit-status '
+              .scripts | has("dependency-update:post")
+            ' "${package_root}/package.json" > /dev/null &&
+              ! /usr/bin/jq --exit-status '
+                (.scripts["dependency-update:post"] | type) == "string" and
+                (.scripts["dependency-update:post"] | test("\\S"))
+              ' "${package_root}/package.json" > /dev/null; then
+              echo "::error::${package_root}/package.json must define dependency-update:post as a non-empty script when present."
+              exit 1
+            fi
+
+            if /usr/bin/jq --exit-status '
               .devEngines.packageManager != null
             ' "${package_root}/package.json" > /dev/null; then
               echo "::error::${package_root}/package.json must not define devEngines.packageManager."
@@ -274,23 +285,59 @@ jobs:
             exit 1
           fi
 
+          read_manifest_contract() {
+            jq --compact-output --sort-keys '
+              del(
+                .packageManager,
+                .dependencies,
+                .devDependencies,
+                .optionalDependencies,
+                .peerDependencies
+              )
+            ' "$1"
+          }
+
+          read_node_types_contract() {
+            jq --compact-output --sort-keys '
+              {
+                dependencies: (
+                  (.dependencies // {}) |
+                  with_entries(select(.key == "@types/node"))
+                ),
+                devDependencies: (
+                  (.devDependencies // {}) |
+                  with_entries(select(.key == "@types/node"))
+                ),
+                optionalDependencies: (
+                  (.optionalDependencies // {}) |
+                  with_entries(select(.key == "@types/node"))
+                )
+              }
+            ' "$1"
+          }
+
+          declare -A manifest_contracts=()
+          declare -A dependency_update_post_states=()
+          declare -A node_types_contracts=()
+
+          while IFS= read -r package_root; do
+            manifest_contracts["${package_root}"]="$(
+              read_manifest_contract "${package_root}/package.json"
+            )"
+            dependency_update_post_states["${package_root}"]="$(
+              jq --raw-output '
+                .scripts | has("dependency-update:post")
+              ' "${package_root}/package.json"
+            )"
+          done < "${RUNNER_TEMP}/dependency-update-package-roots"
+
           while IFS= read -r package_root; do
             echo "::group::Update ${package_root}"
 
             (
               cd -- "${package_root}"
 
-              manifest_contract_json="$(
-                jq --compact-output --sort-keys '
-                  del(
-                    .packageManager,
-                    .dependencies,
-                    .devDependencies,
-                    .optionalDependencies,
-                    .peerDependencies
-                  )
-                ' package.json
-              )"
+              manifest_contract_json="${manifest_contracts["${package_root}"]}"
 
               node --input-type=commonjs --eval '
                 const fs = require("node:fs");
@@ -395,15 +442,7 @@ jobs:
                 node --print "require('./package.json').packageManager"
               )"
               updated_manifest_contract_json="$(
-                jq --compact-output --sort-keys '
-                  del(
-                    .packageManager,
-                    .dependencies,
-                    .devDependencies,
-                    .optionalDependencies,
-                    .peerDependencies
-                  )
-                ' package.json
+                read_manifest_contract package.json
               )"
 
               if [ "${updated_package_manager}" != "pnpm@${PNPM_VERSION}" ]; then
@@ -418,6 +457,102 @@ jobs:
             )
 
             echo "::endgroup::"
+          done < "${RUNNER_TEMP}/dependency-update-package-roots"
+
+          while IFS= read -r package_root; do
+            node_types_contracts["${package_root}"]="$(
+              read_node_types_contract "${package_root}/package.json"
+            )"
+          done < "${RUNNER_TEMP}/dependency-update-package-roots"
+
+          while IFS= read -r package_root; do
+            if [ "${dependency_update_post_states["${package_root}"]}" != "true" ]; then
+              continue
+            fi
+
+            echo "::group::Post-update alignment ${package_root}"
+
+            (
+              cd -- "${package_root}"
+
+              manifest_contract_json="${manifest_contracts["${package_root}"]}"
+              node_types_contract_json="${node_types_contracts["${package_root}"]}"
+              current_package_manager="$(
+                node --print "require('./package.json').packageManager"
+              )"
+              current_manifest_contract_json="$(
+                read_manifest_contract package.json
+              )"
+              current_node_types_contract_json="$(
+                read_node_types_contract package.json
+              )"
+
+              if [ "${current_package_manager}" != "pnpm@${PNPM_VERSION}" ] ||
+                [ "${current_manifest_contract_json}" != "${manifest_contract_json}" ] ||
+                [ "${current_node_types_contract_json}" != "${node_types_contract_json}" ]; then
+                echo "::error::The package contract changed before dependency-update:post in ${package_root}."
+                exit 1
+              fi
+
+              corepack \
+                "pnpm@${PNPM_VERSION}" \
+                --config.enable-pre-post-scripts=false \
+                run \
+                dependency-update:post
+
+              updated_package_manager="$(
+                node --print "require('./package.json').packageManager"
+              )"
+              updated_manifest_contract_json="$(
+                read_manifest_contract package.json
+              )"
+              updated_node_types_contract_json="$(
+                read_node_types_contract package.json
+              )"
+
+              if [ "${updated_package_manager}" != "pnpm@${PNPM_VERSION}" ]; then
+                echo "::error::dependency-update:post changed packageManager in ${package_root}."
+                exit 1
+              fi
+
+              if [ "${updated_manifest_contract_json}" != "${manifest_contract_json}" ]; then
+                echo "::error::dependency-update:post changed non-dependency package fields in ${package_root}."
+                exit 1
+              fi
+
+              if [ "${updated_node_types_contract_json}" != "${node_types_contract_json}" ]; then
+                echo "::error::dependency-update:post changed the direct @types/node declaration in ${package_root}."
+                exit 1
+              fi
+
+              corepack \
+                "pnpm@${PNPM_VERSION}" \
+                install \
+                --lockfile-only \
+                --no-frozen-lockfile \
+                --ignore-scripts
+            )
+
+            echo "::endgroup::"
+          done < "${RUNNER_TEMP}/dependency-update-package-roots"
+
+          while IFS= read -r package_root; do
+            final_package_manager="$(
+              jq --raw-output '.packageManager' "${package_root}/package.json"
+            )"
+            final_manifest_contract_json="$(
+              read_manifest_contract "${package_root}/package.json"
+            )"
+            final_node_types_contract_json="$(
+              read_node_types_contract "${package_root}/package.json"
+            )"
+
+            if [ "${final_package_manager}" != "pnpm@${PNPM_VERSION}" ] ||
+              [ "${final_manifest_contract_json}" != "${manifest_contracts["${package_root}"]}" ] ||
+              [ "${final_node_types_contract_json}" != "${node_types_contracts["${package_root}"]}" ]; then
+              echo "::error::The final package contract changed after post-update alignment in ${package_root}."
+              exit 1
+            fi
           done < "${RUNNER_TEMP}/dependency-update-package-roots"
 
       - name: Detect dependency changes
@@ -907,6 +1042,7 @@ jobs:
             echo "- Ran \`pnpm up --latest\` in every configured package root."
             echo "- Synchronized \`packageManager\` to \`pnpm@${PNPM_VERSION}\`."
             echo "- Kept direct \`@types/node\` dependencies on the active Node LTS major."
+            echo "- Applied the repository-owned \`dependency-update:post\` alignment hook where configured."
             echo "- Regenerated the affected pnpm lockfiles."
             echo
             echo "## Validation"
