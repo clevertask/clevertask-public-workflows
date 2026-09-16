@@ -7,6 +7,11 @@ on:
         description: JSON array of package roots relative to the caller repository
         required: true
         type: string
+      post_update_workspace_overrides:
+        description: JSON object mapping package roots to existing scalar pnpm workspace override keys their post-update hook may change
+        required: false
+        default: "{}"
+        type: string
       node_version_file:
         description: Node version file relative to the caller repository
         required: false
@@ -40,6 +45,176 @@ permissions: {}
 env:
   COREPACK_VERSION: "0.34.5"
   PNPM_VERSION: "11.17.0"
+  WORKSPACE_OVERRIDE_VERIFIER: |
+    import json
+    import re
+    import sys
+    from pathlib import Path
+
+    SENTINEL = "__DEPENDENCY_UPDATE_OVERRIDE_VALUE__"
+
+    def fail(label, message):
+        raise ValueError(f"{label}: {message}")
+
+    def validate_string(value, label):
+        if not value:
+            fail(label, "must be a non-empty string")
+        if any(
+            ord(character) < 0x20
+            or ord(character) == 0x7F
+            or 0xD800 <= ord(character) <= 0xDFFF
+            or character in "\u0085\u2028\u2029"
+            for character in value
+        ):
+            fail(label, "must not contain control or line-separator characters")
+        return value
+
+    def is_non_string_plain_scalar(token):
+        return bool(
+            re.fullmatch(r"(?:null|true|false|yes|no|on|off|~)", token, re.I)
+            or re.fullmatch(
+                r"[+-]?(?:"
+                r"0[xX][0-9a-fA-F]+|"
+                r"0[oO][0-7]+|"
+                r"(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?|"
+                r"\.(?:inf|nan)"
+                r")",
+                token,
+                re.I,
+            )
+        )
+
+    def decode_scalar(token, label):
+        if token.startswith("'"):
+            if not re.fullmatch(r"'(?:[^']|'')*'", token):
+                fail(label, "unsupported single-quoted scalar")
+            value = token[1:-1].replace("''", "'")
+            return "single", validate_string(value, label)
+        if token.startswith('"'):
+            if not re.fullmatch(
+                r'"(?:[^"\\]|\\["\\/bfnrt]|\\u[0-9a-fA-F]{4})*"', token
+            ):
+                fail(label, "unsupported double-quoted scalar")
+            return "double", validate_string(json.loads(token), label)
+        if (
+            not re.fullmatch(
+                r"[A-Za-z0-9^~<>=+$][A-Za-z0-9._~^*+/@:%$=<>?-]*", token
+            )
+            or token.startswith(">")
+            or token.endswith(":")
+            or is_non_string_plain_scalar(token)
+        ):
+            fail(label, "unsupported plain string scalar; quote the value explicitly")
+        return "plain", validate_string(token, label)
+
+    def decode_key(token, label):
+        if token.startswith(("'", '"')):
+            _, value = decode_scalar(token, label)
+            return value
+        if (
+            token != token.strip()
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9@/._+*<>=~^? -]*", token)
+            or is_non_string_plain_scalar(token)
+        ):
+            fail(label, "unsupported plain string key; quote the key explicitly")
+        return validate_string(token, label)
+
+    def mask_scalar(style):
+        if style == "single":
+            return f"'{SENTINEL}'"
+        if style == "double":
+            return f'"{SENTINEL}"'
+        return SENTINEL
+
+    def parse_workspace(file_name, label, allowed_keys):
+        payload = Path(file_name).read_bytes()
+        if len(payload) > 1024 * 1024:
+            fail(label, "pnpm-workspace.yaml exceeds the 1 MiB verification limit")
+        try:
+            source = payload.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise ValueError(f"{label}: pnpm-workspace.yaml must be valid UTF-8") from error
+        if source.startswith("\ufeff") or "\0" in source:
+            fail(label, "pnpm-workspace.yaml must not contain a BOM or NUL byte")
+
+        lines = source.splitlines(keepends=True)
+        bodies = []
+        for line in lines:
+            if line.endswith("\r\n"):
+                body, ending = line[:-2], "\r\n"
+            elif line.endswith("\n"):
+                body, ending = line[:-1], "\n"
+            elif line.endswith("\r") or "\r" in line:
+                fail(label, "pnpm-workspace.yaml contains a bare carriage return")
+            else:
+                body, ending = line, ""
+            bodies.append((body, ending))
+
+        headers = []
+        for index, (body, _) in enumerate(bodies):
+            if re.match(r'''^(?:overrides|'overrides'|"overrides")[ \t]*:''', body):
+                if body != "overrides:":
+                    fail(label, "the top-level overrides header must be exactly `overrides:`")
+                headers.append(index)
+        if len(headers) != 1:
+            fail(label, "pnpm-workspace.yaml must contain exactly one top-level overrides block")
+
+        masked_lines = list(lines)
+        seen_keys = set()
+        entry_pattern = re.compile(
+            r'''^  ('(?:[^']|'')*'|"(?:[^"\\]|\\["\\/bfnrt]|\\u[0-9a-fA-F]{4})*"|[A-Za-z0-9][A-Za-z0-9@/._+*<>=~^? -]*):([ \t]+)(.*)$'''
+        )
+        for index in range(headers[0] + 1, len(bodies)):
+            body, ending = bodies[index]
+            if re.fullmatch(r"[ \t]*(?:#.*)?", body):
+                continue
+            if not re.match(r"^[ \t]", body):
+                break
+            entry = entry_pattern.fullmatch(body)
+            if not entry:
+                fail(label, "overrides must be a direct two-space-indented scalar mapping")
+            key_token, separator, remainder = entry.groups()
+            value_token = remainder.rstrip(" \t")
+            trailing_whitespace = remainder[len(value_token):]
+            key = decode_key(key_token, f"{label} override key")
+            style, value = decode_scalar(value_token, f"{label} override {key}")
+            if key in seen_keys:
+                fail(label, f"duplicate override key {key}")
+            seen_keys.add(key)
+            if key in allowed_keys:
+                masked_lines[index] = (
+                    f"  {key_token}:{separator}{mask_scalar(style)}"
+                    f"{trailing_whitespace}{ending}"
+                )
+
+        missing_keys = allowed_keys - seen_keys
+        if missing_keys:
+            fail(label, "allowlisted override keys are missing: " + ", ".join(sorted(missing_keys)))
+        if not seen_keys:
+            fail(label, "the top-level overrides block must not be empty")
+        return "".join(masked_lines)
+
+    try:
+        if len(sys.argv) != 4:
+            raise ValueError("expected base path, candidate path, and allowed override keys")
+        allowed_value = json.loads(sys.argv[3])
+        if (
+            not isinstance(allowed_value, list)
+            or not allowed_value
+            or any(not isinstance(key, str) or not key.strip() for key in allowed_value)
+            or len(set(allowed_value)) != len(allowed_value)
+        ):
+            raise ValueError("allowed override keys must be a non-empty array of unique strings")
+        allowed_keys = set(allowed_value)
+        base = parse_workspace(sys.argv[1], "base workspace", allowed_keys)
+        candidate = parse_workspace(sys.argv[2], "candidate workspace", allowed_keys)
+        if base != candidate:
+            raise ValueError(
+                "pnpm-workspace.yaml changed outside allowlisted top-level overrides scalar values"
+            )
+    except (OSError, ValueError) as error:
+        print(f"::error::{error}", file=sys.stderr)
+        raise SystemExit(1)
 
 concurrency:
   group: weekly-pnpm-dependency-update-${{ github.repository }}
@@ -119,6 +294,7 @@ jobs:
         env:
           NODE_VERSION_FILE: ${{ inputs.node_version_file }}
           PACKAGE_ROOTS: ${{ inputs.package_roots }}
+          POST_UPDATE_WORKSPACE_OVERRIDES: ${{ inputs.post_update_workspace_overrides }}
         run: |
           repository_root="$(/usr/bin/realpath -- "${GITHUB_WORKSPACE}")"
 
@@ -164,8 +340,11 @@ jobs:
 
           raw_package_roots="${RUNNER_TEMP}/dependency-update-package-roots-input"
           validated_package_roots="${RUNNER_TEMP}/dependency-update-package-roots"
+          validated_workspace_override_roots="${RUNNER_TEMP}/dependency-update-workspace-override-roots"
+          workspace_override_baseline_root="${RUNNER_TEMP}/dependency-update-workspace-override-baseline"
           /usr/bin/jq --raw-output '.[]' <<< "${PACKAGE_ROOTS}" > "${raw_package_roots}"
           : > "${validated_package_roots}"
+          : > "${validated_workspace_override_roots}"
           declare -A seen_package_roots=()
 
           while IFS= read -r package_root; do
@@ -246,6 +425,72 @@ jobs:
               >> "${validated_package_roots}"
           done < "${raw_package_roots}"
 
+          if ! /usr/bin/jq --exit-status '
+            type == "object" and
+            all(
+              to_entries[];
+              (.key | test("\\S") and (test("[\\r\\n]") | not)) and
+              (
+                .value |
+                type == "array" and
+                length > 0 and
+                all(.[]; type == "string" and test("\\S") and (test("[\\r\\n]") | not)) and
+                (unique | length) == length
+              )
+            )
+          ' <<< "${POST_UPDATE_WORKSPACE_OVERRIDES}" > /dev/null; then
+            echo '::error::post_update_workspace_overrides must map unique package roots to non-empty arrays of unique, non-empty override keys.'
+            exit 1
+          fi
+
+          normalized_workspace_overrides="$(
+            /usr/bin/jq --compact-output --sort-keys '.' \
+              <<< "${POST_UPDATE_WORKSPACE_OVERRIDES}"
+          )"
+          declare -A seen_workspace_override_roots=()
+
+          while IFS= read -r package_root; do
+            validate_repository_path "${package_root}" "Post-update workspace override root"
+            resolved_package_root="$(/usr/bin/realpath -- "${package_root}")"
+
+            if [[ -z "${seen_package_roots[${resolved_package_root}]+present}" ]]; then
+              echo "::error::Post-update workspace override root must also be a package root: ${package_root}"
+              exit 1
+            fi
+
+            if [[ -n "${seen_workspace_override_roots[${resolved_package_root}]+present}" ]]; then
+              echo "::error::Post-update workspace override roots resolve to the same directory: ${package_root}"
+              exit 1
+            fi
+
+            if ! /usr/bin/jq --exit-status '
+              (.scripts["dependency-update:post"] | type) == "string" and
+              (.scripts["dependency-update:post"] | test("\\S"))
+            ' "${resolved_package_root}/package.json" > /dev/null; then
+              echo "::error::Post-update workspace override root must declare dependency-update:post on the checked-out base: ${package_root}"
+              exit 1
+            fi
+
+            normalized_package_root="$(
+              /usr/bin/realpath --relative-to="${repository_root}" -- "${resolved_package_root}"
+            )"
+            workspace_file="${resolved_package_root}/pnpm-workspace.yaml"
+            baseline_file="${workspace_override_baseline_root}/${normalized_package_root}/pnpm-workspace.yaml"
+
+            if [ ! -f "${workspace_file}" ] || [ -L "${workspace_file}" ]; then
+              echo "::error::Post-update workspace override root must have a regular pnpm-workspace.yaml: ${package_root}"
+              exit 1
+            fi
+
+            /usr/bin/mkdir --parents "$(/usr/bin/dirname -- "${baseline_file}")"
+            /usr/bin/cp --no-preserve=mode,ownership,timestamps -- "${workspace_file}" "${baseline_file}"
+            /usr/bin/chmod 0444 "${baseline_file}"
+            seen_workspace_override_roots["${resolved_package_root}"]=true
+            printf '%s\n' "${normalized_package_root}" >> "${validated_workspace_override_roots}"
+          done < <(
+            /usr/bin/jq --raw-output 'keys[]' <<< "${normalized_workspace_overrides}"
+          )
+
           validate_repository_path "${NODE_VERSION_FILE}" "Node version file"
 
           if [ ! -f "${NODE_VERSION_FILE}" ] ||
@@ -271,7 +516,23 @@ jobs:
 
       - name: Update dependencies
         if: steps.open_pull_request.outputs.skipped != 'true'
+        env:
+          POST_UPDATE_WORKSPACE_OVERRIDES: ${{ inputs.post_update_workspace_overrides }}
         run: |
+          verify_workspace_override_change() {
+            local verifier_digest
+            verifier_digest="$(
+              printf '%s' "${WORKSPACE_OVERRIDE_VERIFIER}" | /usr/bin/sha256sum
+            )"
+
+            if [ "${verifier_digest%% *}" != "ab5397bc8de5256dc039af666d1736793f01fa58ad0178df66e87671afebe13f" ]; then
+              echo "::error::The workspace override verifier failed its integrity check."
+              exit 1
+            fi
+
+            /usr/bin/python3 -I -c "${WORKSPACE_OVERRIDE_VERIFIER}" "$1" "$2" "$3"
+          }
+
           node_major="$(node --print "process.versions.node.split('.')[0]")"
           node_lts_codename="$(node --print "process.release.lts ?? ''")"
 
@@ -319,6 +580,28 @@ jobs:
           declare -A manifest_contracts=()
           declare -A dependency_update_post_states=()
           declare -A node_types_contracts=()
+          declare -A workspace_override_keys_by_root=()
+
+          normalized_workspace_overrides="$(
+            /usr/bin/jq --compact-output --sort-keys '.' \
+              <<< "${POST_UPDATE_WORKSPACE_OVERRIDES}"
+          )"
+
+          while IFS= read -r configured_package_root; do
+            resolved_package_root="$(/usr/bin/realpath -- "${configured_package_root}")"
+            normalized_package_root="$(
+              /usr/bin/realpath --relative-to="${GITHUB_WORKSPACE}" -- "${resolved_package_root}"
+            )"
+            workspace_override_keys_by_root["${normalized_package_root}"]="$(
+              /usr/bin/jq \
+                --compact-output \
+                --arg package_root "${configured_package_root}" \
+                '.[$package_root]' \
+                <<< "${normalized_workspace_overrides}"
+            )"
+          done < <(
+            /usr/bin/jq --raw-output 'keys[]' <<< "${normalized_workspace_overrides}"
+          )
 
           while IFS= read -r package_root; do
             manifest_contracts["${package_root}"]="$(
@@ -477,6 +760,8 @@ jobs:
 
               manifest_contract_json="${manifest_contracts["${package_root}"]}"
               node_types_contract_json="${node_types_contracts["${package_root}"]}"
+              workspace_override_baseline="${RUNNER_TEMP}/dependency-update-workspace-override-baseline/${package_root}/pnpm-workspace.yaml"
+              workspace_override_verified="${RUNNER_TEMP}/dependency-update-workspace-override-verified/${package_root}/pnpm-workspace.yaml"
               current_package_manager="$(
                 node --print "require('./package.json').packageManager"
               )"
@@ -492,6 +777,18 @@ jobs:
                 [ "${current_node_types_contract_json}" != "${node_types_contract_json}" ]; then
                 echo "::error::The package contract changed before dependency-update:post in ${package_root}."
                 exit 1
+              fi
+
+              if [[ -n "${workspace_override_keys_by_root[${package_root}]+present}" ]]; then
+                if ! /usr/bin/cmp --silent -- "${workspace_override_baseline}" pnpm-workspace.yaml; then
+                  echo "::error::${package_root}/pnpm-workspace.yaml changed before dependency-update:post."
+                  exit 1
+                fi
+
+                verify_workspace_override_change \
+                  "${workspace_override_baseline}" \
+                  pnpm-workspace.yaml \
+                  "${workspace_override_keys_by_root[${package_root}]}"
               fi
 
               corepack \
@@ -525,12 +822,34 @@ jobs:
                 exit 1
               fi
 
+              if [[ -n "${workspace_override_keys_by_root[${package_root}]+present}" ]]; then
+                if [ ! -f pnpm-workspace.yaml ] || [ -L pnpm-workspace.yaml ]; then
+                  echo "::error::dependency-update:post must leave a regular pnpm-workspace.yaml in ${package_root}."
+                  exit 1
+                fi
+
+                verify_workspace_override_change \
+                  "${workspace_override_baseline}" \
+                  pnpm-workspace.yaml \
+                  "${workspace_override_keys_by_root[${package_root}]}"
+                /usr/bin/mkdir --parents "$(/usr/bin/dirname -- "${workspace_override_verified}")"
+                /usr/bin/cp --no-preserve=mode,ownership,timestamps -- \
+                  pnpm-workspace.yaml "${workspace_override_verified}"
+                /usr/bin/chmod 0444 "${workspace_override_verified}"
+              fi
+
               corepack \
                 "pnpm@${PNPM_VERSION}" \
                 install \
                 --lockfile-only \
                 --no-frozen-lockfile \
                 --ignore-scripts
+
+              if [[ -n "${workspace_override_keys_by_root[${package_root}]+present}" ]] &&
+                ! /usr/bin/cmp --silent -- "${workspace_override_verified}" pnpm-workspace.yaml; then
+                echo "::error::The lockfile reconciliation changed ${package_root}/pnpm-workspace.yaml."
+                exit 1
+              fi
             )
 
             echo "::endgroup::"
@@ -553,6 +872,18 @@ jobs:
               echo "::error::The final package contract changed after post-update alignment in ${package_root}."
               exit 1
             fi
+
+            if [[ -n "${workspace_override_keys_by_root[${package_root}]+present}" ]]; then
+              workspace_override_verified="${RUNNER_TEMP}/dependency-update-workspace-override-verified/${package_root}/pnpm-workspace.yaml"
+
+              if [ ! -f "${package_root}/pnpm-workspace.yaml" ] ||
+                [ -L "${package_root}/pnpm-workspace.yaml" ] ||
+                ! /usr/bin/cmp --silent -- \
+                  "${workspace_override_verified}" "${package_root}/pnpm-workspace.yaml"; then
+                echo "::error::${package_root}/pnpm-workspace.yaml changed after its verified post-update hook."
+                exit 1
+              fi
+            fi
           done < "${RUNNER_TEMP}/dependency-update-package-roots"
 
       - name: Detect dependency changes
@@ -569,7 +900,23 @@ jobs:
 
       - name: Snapshot dependency changes
         if: steps.changes.outputs.changed == 'true'
+        env:
+          POST_UPDATE_WORKSPACE_OVERRIDES: ${{ inputs.post_update_workspace_overrides }}
         run: |
+          verify_workspace_override_change() {
+            local verifier_digest
+            verifier_digest="$(
+              printf '%s' "${WORKSPACE_OVERRIDE_VERIFIER}" | /usr/bin/sha256sum
+            )"
+
+            if [ "${verifier_digest%% *}" != "ab5397bc8de5256dc039af666d1736793f01fa58ad0178df66e87671afebe13f" ]; then
+              echo "::error::The workspace override verifier failed its integrity check."
+              exit 1
+            fi
+
+            /usr/bin/python3 -I -c "${WORKSPACE_OVERRIDE_VERIFIER}" "$1" "$2" "$3"
+          }
+
           if ! /usr/bin/git diff --cached --quiet; then
             echo "::error::The dependency update staged files before the snapshot boundary."
             /usr/bin/git diff --cached --name-only
@@ -597,6 +944,80 @@ jobs:
             )"
             printf '%s\n' "${package_manifest}" "${lockfile}" >> "${allowed_paths}"
           done < "${RUNNER_TEMP}/dependency-update-package-roots"
+
+          if ! /usr/bin/jq --exit-status '
+            type == "object" and
+            all(
+              to_entries[];
+              (.key | test("\\S") and (test("[\\r\\n]") | not)) and
+              (
+                .value |
+                type == "array" and
+                length > 0 and
+                all(.[]; type == "string" and test("\\S") and (test("[\\r\\n]") | not)) and
+                (unique | length) == length
+              )
+            )
+          ' <<< "${POST_UPDATE_WORKSPACE_OVERRIDES}" > /dev/null; then
+            echo '::error::post_update_workspace_overrides must map unique package roots to non-empty arrays of unique, non-empty override keys.'
+            exit 1
+          fi
+
+          normalized_workspace_overrides="$(
+            /usr/bin/jq --compact-output --sort-keys '.' \
+              <<< "${POST_UPDATE_WORKSPACE_OVERRIDES}"
+          )"
+          repository_root="$(/usr/bin/realpath -- "${GITHUB_WORKSPACE}")"
+
+          while IFS= read -r configured_package_root; do
+            resolved_package_root="$(/usr/bin/realpath -- "${configured_package_root}")"
+
+            case "${resolved_package_root}" in
+              "${repository_root}" | "${repository_root}"/*) ;;
+              *)
+                echo "::error::Post-update workspace override root resolves outside the caller repository: ${configured_package_root}"
+                exit 1
+                ;;
+            esac
+
+            package_root="$(
+              /usr/bin/realpath --relative-to="${repository_root}" -- "${resolved_package_root}"
+            )"
+
+            if ! /usr/bin/grep --fixed-strings --line-regexp -- \
+              "${package_root}" "${RUNNER_TEMP}/dependency-update-package-roots" > /dev/null; then
+              echo "::error::Post-update workspace override root must also be a package root: ${configured_package_root}"
+              exit 1
+            fi
+
+            allowed_override_keys="$(
+              /usr/bin/jq \
+                --compact-output \
+                --arg package_root "${configured_package_root}" \
+                '.[$package_root]' \
+                <<< "${normalized_workspace_overrides}"
+            )"
+            workspace_file="${package_root}/pnpm-workspace.yaml"
+            baseline_file="${RUNNER_TEMP}/dependency-update-workspace-override-baseline/${package_root}/pnpm-workspace.yaml"
+
+            if [ ! -f "${workspace_file}" ] || [ -L "${workspace_file}" ]; then
+              echo "::error::Dependency workspace source must be a regular file: ${workspace_file}"
+              exit 1
+            fi
+
+            verify_workspace_override_change \
+              "${baseline_file}" \
+              "${workspace_file}" \
+              "${allowed_override_keys}"
+            workspace_path="$(
+              /usr/bin/realpath --relative-to="${repository_root}" -- "${workspace_file}"
+            )"
+            printf '%s\n' "${workspace_path}" >> "${allowed_paths}"
+          done < <(
+            /usr/bin/jq --raw-output 'keys[]' <<< "${normalized_workspace_overrides}"
+          )
+
+          /usr/bin/sort --unique --output="${allowed_paths}" "${allowed_paths}"
 
           {
             /usr/bin/git diff --name-only
@@ -787,14 +1208,31 @@ jobs:
         if: steps.open_pull_request.outputs.skipped != 'true'
         env:
           PACKAGE_ROOTS: ${{ inputs.package_roots }}
+          POST_UPDATE_WORKSPACE_OVERRIDES: ${{ inputs.post_update_workspace_overrides }}
         run: |
+          verify_workspace_override_change() {
+            local verifier_digest
+            verifier_digest="$(
+              printf '%s' "${WORKSPACE_OVERRIDE_VERIFIER}" | /usr/bin/sha256sum
+            )"
+
+            if [ "${verifier_digest%% *}" != "ab5397bc8de5256dc039af666d1736793f01fa58ad0178df66e87671afebe13f" ]; then
+              echo "::error::The workspace override verifier failed its integrity check."
+              exit 1
+            fi
+
+            /usr/bin/python3 -I -c "${WORKSPACE_OVERRIDE_VERIFIER}" "$1" "$2" "$3"
+          }
+
           repository_root="$(/usr/bin/realpath -- "${GITHUB_WORKSPACE}")"
           artifact_root="${RUNNER_TEMP}/dependency-update-artifact"
           allowed_paths="${RUNNER_TEMP}/dependency-update-allowed-paths"
           artifact_paths="${RUNNER_TEMP}/dependency-update-artifact-paths"
           validated_package_roots="${RUNNER_TEMP}/dependency-update-package-roots"
+          workspace_override_paths="${RUNNER_TEMP}/dependency-update-workspace-override-paths"
           : > "${allowed_paths}"
           : > "${validated_package_roots}"
+          : > "${workspace_override_paths}"
 
           if ! /usr/bin/jq --exit-status '
             type == "array" and
@@ -805,6 +1243,29 @@ jobs:
             echo '::error::package_roots must be a non-empty JSON array of unique paths.'
             exit 1
           fi
+
+          if ! /usr/bin/jq --exit-status '
+            type == "object" and
+            all(
+              to_entries[];
+              (.key | test("\\S") and (test("[\\r\\n]") | not)) and
+              (
+                .value |
+                type == "array" and
+                length > 0 and
+                all(.[]; type == "string" and test("\\S") and (test("[\\r\\n]") | not)) and
+                (unique | length) == length
+              )
+            )
+          ' <<< "${POST_UPDATE_WORKSPACE_OVERRIDES}" > /dev/null; then
+            echo '::error::post_update_workspace_overrides must map unique package roots to non-empty arrays of unique, non-empty override keys.'
+            exit 1
+          fi
+
+          normalized_workspace_overrides="$(
+            /usr/bin/jq --compact-output --sort-keys '.' \
+              <<< "${POST_UPDATE_WORKSPACE_OVERRIDES}"
+          )"
 
           declare -A seen_package_roots=()
 
@@ -859,8 +1320,76 @@ jobs:
               >> "${allowed_paths}"
           done < <(/usr/bin/jq --raw-output '.[]' <<< "${PACKAGE_ROOTS}")
 
+          declare -A seen_workspace_override_roots=()
+          declare -A workspace_override_keys_by_path=()
+
+          while IFS= read -r package_root; do
+            if [[ "${package_root}" == *$'\r'* ]] ||
+              [[ "${package_root}" == *$'\n'* ]] ||
+              [[ "${package_root}" = /* ]] || [[ "${package_root}" == ".." ]] ||
+              [[ "${package_root}" == ../* ]] || [[ "${package_root}" == */../* ]] ||
+              [[ "${package_root}" == */.. ]]; then
+              echo "::error::Post-update workspace override root must stay inside the caller repository: ${package_root}"
+              exit 1
+            fi
+
+            if [ ! -e "${package_root}" ]; then
+              echo "::error::Post-update workspace override root does not exist: ${package_root}"
+              exit 1
+            fi
+
+            resolved_package_root="$(/usr/bin/realpath -- "${package_root}")"
+
+            if [[ -z "${seen_package_roots[${resolved_package_root}]+present}" ]]; then
+              echo "::error::Post-update workspace override root must also be a package root: ${package_root}"
+              exit 1
+            fi
+
+            if [[ -n "${seen_workspace_override_roots[${resolved_package_root}]+present}" ]]; then
+              echo "::error::Post-update workspace override roots resolve to the same directory: ${package_root}"
+              exit 1
+            fi
+
+            normalized_package_root="$(
+              /usr/bin/realpath --relative-to="${repository_root}" -- "${resolved_package_root}"
+            )"
+            workspace_file="${normalized_package_root}/pnpm-workspace.yaml"
+            workspace_file="${workspace_file#./}"
+
+            if [ ! -f "${workspace_file}" ] || [ -L "${workspace_file}" ]; then
+              echo "::error::Post-update workspace override root must have a regular pnpm-workspace.yaml: ${package_root}"
+              exit 1
+            fi
+
+            if ! /usr/bin/jq --exit-status '
+              (.scripts["dependency-update:post"] | type) == "string" and
+              (.scripts["dependency-update:post"] | test("\\S"))
+            ' "${normalized_package_root}/package.json" > /dev/null; then
+              echo "::error::Post-update workspace override root must declare dependency-update:post on the validated base: ${package_root}"
+              exit 1
+            fi
+
+            allowed_override_keys="$(
+              /usr/bin/jq \
+                --compact-output \
+                --arg package_root "${package_root}" \
+                '.[$package_root]' \
+                <<< "${normalized_workspace_overrides}"
+            )"
+            seen_workspace_override_roots["${resolved_package_root}"]=true
+            workspace_override_keys_by_path["${workspace_file}"]="${allowed_override_keys}"
+            printf '%s\n' "${workspace_file}" >> "${workspace_override_paths}"
+            printf '%s\n' "${workspace_file}" >> "${allowed_paths}"
+          done < <(
+            /usr/bin/jq --raw-output 'keys[]' <<< "${normalized_workspace_overrides}"
+          )
+
           /usr/bin/sed --in-place 's#^\./##' "${allowed_paths}"
           /usr/bin/sort --unique --output="${allowed_paths}" "${allowed_paths}"
+          /usr/bin/sort \
+            --unique \
+            --output="${workspace_override_paths}" \
+            "${workspace_override_paths}"
 
           unexpected_artifact_entry="$(
             /usr/bin/find "${artifact_root}" \
@@ -942,6 +1471,19 @@ jobs:
                 echo "::error::Dependency artifact changed non-dependency package fields: ${allowed_path}"
                 exit 1
               fi
+            fi
+
+            if /usr/bin/grep --fixed-strings --line-regexp -- \
+              "${allowed_path}" "${workspace_override_paths}" > /dev/null; then
+              if [ ! -f "${destination}" ] || [ -L "${destination}" ]; then
+                echo "::error::Validated base must contain a regular workspace file: ${allowed_path}"
+                exit 1
+              fi
+
+              verify_workspace_override_change \
+                "${destination}" \
+                "${artifact_file}" \
+                "${workspace_override_keys_by_path["${allowed_path}"]}"
             fi
 
             /usr/bin/cp \
@@ -1042,7 +1584,7 @@ jobs:
             echo "- Ran \`pnpm up --latest\` in every configured package root."
             echo "- Synchronized \`packageManager\` to \`pnpm@${PNPM_VERSION}\`."
             echo "- Kept direct \`@types/node\` dependencies on the active Node LTS major."
-            echo "- Applied the repository-owned \`dependency-update:post\` alignment hook where configured."
+            echo "- Applied each repository-owned \`dependency-update:post\` hook within its declared manifest, lockfile, and workspace-override boundaries."
             echo "- Regenerated the affected pnpm lockfiles."
             echo
             echo "## Validation"
