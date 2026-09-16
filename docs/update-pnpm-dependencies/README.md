@@ -9,6 +9,14 @@ request in the caller repository.
   Required JSON array of package roots relative to the caller repository. Use
   `["."]` for a single-package repository or values such as
   `["client","server","mcp"]` for independent package roots.
+- `post_update_workspace_overrides`:
+  Optional JSON object, defaulting to `{}`, that maps configured package roots
+  to the exact existing top-level `overrides` keys whose string scalar values
+  the root's base-declared `dependency-update:post` hook may change in
+  `pnpm-workspace.yaml`. Every root must map to a non-empty array of unique,
+  non-empty keys. The input does not permit changing unlisted override values,
+  adding, removing, renaming, reordering, or restructuring overrides, or
+  changing any other workspace setting.
 - `node_version_file`:
   Node version file relative to the caller repository. Defaults to `.nvmrc`.
 - `review_team`:
@@ -42,6 +50,15 @@ The caller repository must:
   credentials and changes only dependency fields in the package manifest and
   its pnpm lockfile, without changing a direct `@types/node` declaration owned
   by the shared workflow;
+- when that hook must align existing pnpm workspace overrides, explicitly list
+  its package root and exact writable keys in `post_update_workspace_overrides`,
+  and keep the top-level `overrides` block as a direct two-space-indented mapping
+  of unique keys to non-empty, single-line string scalar values. Every
+  allowlisted key must already exist. Quote values that are not YAML plain
+  string scalars, including semver ranges beginning with `>`. Keep comments on
+  their own lines; inline value comments are outside the accepted canonical
+  form. Comments, formatting, and unlisted override values are preserved but
+  cannot be changed by the hook;
 - keep a Node LTS selector in the configured Node version file;
 - configure update policy in each package root's `pnpm-workspace.yaml`.
 
@@ -98,25 +115,30 @@ The workflow:
    through the pinned pnpm version with automatic pre/post lifecycle scripts
    disabled, rejects changes to the centrally synchronized direct `@types/node`
    declaration, then reconciles the lockfile without running lifecycle scripts;
-8. rejects post-update changes to scripts or any other non-dependency package
-   fields besides the intentional `packageManager` synchronization;
-9. exits successfully without an artifact or branch when dependencies did not
+8. for explicitly allowlisted root/key pairs, accepts only string-scalar-value
+   changes to those existing top-level workspace overrides, while preserving
+   unlisted override values, the override keys and structure, comments,
+   formatting, and every other `pnpm-workspace.yaml` setting;
+9. rejects post-update changes to scripts or any other non-dependency package
+   fields besides the intentional `packageManager` synchronization, and rejects
+   workspace changes from roots that were not explicitly opted in;
+10. exits successfully without an artifact or branch when dependencies did not
    change;
-10. snapshots only package manifests and pnpm lockfiles into one immutable
-   artifact;
-11. performs a frozen install and runs `validate:deps` in every package root;
-12. starts a fresh write-capable job, checks out the exact recorded SHA, and
+11. snapshots only package manifests, pnpm lockfiles, and explicitly opted-in
+    workspace files into one immutable artifact;
+12. performs a frozen install and runs `validate:deps` in every package root;
+13. starts a fresh write-capable job, checks out the exact recorded SHA, and
     stops if the default branch moved or another automation PR appeared;
-13. downloads the snapshot by artifact ID, independently verifies every path
-    and non-dependency package field, and applies only the configured manifests
-    and lockfiles;
-14. uses the fresh write-capable job to push the unique branch and open the
+14. downloads the snapshot by artifact ID, independently verifies every path,
+    non-dependency package field, and opted-in workspace override boundary, and
+    applies only the configured manifests, lockfiles, and workspace files;
+15. uses the fresh write-capable job to push the unique branch and open the
     draft pull request only after the snapshot passes independent checks;
-15. uses a separate read-only job to inspect review history with `GITHUB_TOKEN`
+16. uses a separate read-only job to inspect review history with `GITHUB_TOKEN`
     and only the explicitly mapped `review_token` to submit a request for the
     optional configured organization team, without checking out or executing
     package code; and
-16. uses a separate permissionless job to fail the workflow when validation
+17. uses a separate permissionless job to fail the workflow when validation
     failed.
 
 Input, setup, dependency-resolution, or `dependency-update:post` failures happen
@@ -156,10 +178,14 @@ script that already existed on the checked-out base; it does not accept a shell
 command as input, and pnpm's automatic `predependency-update:post` and
 `postdependency-update:post` lifecycle scripts are disabled for the invocation.
 The artifact is treated as untrusted input: the publish job downloads it by
-immutable ID, checks its digest through
-`actions/download-artifact`, rejects non-regular or unexpected paths, and never
-executes code from it. Checkout credentials are not persisted, and Git or
-GitHub CLI write operations happen only after these checks pass.
+immutable ID, checks its digest through `actions/download-artifact`, rejects
+non-regular or unexpected paths, independently compares opted-in workspace
+files with the trusted base, and never executes code from it. The workspace
+comparison accepts only the string scalar tokens of the explicitly allowlisted
+existing top-level override entries; it rejects unlisted value, key, structure,
+comment, formatting, and unrelated setting changes. Checkout credentials are
+not persisted, and Git or GitHub CLI write operations happen only after these
+checks pass.
 
 ## Outputs
 
@@ -199,6 +225,11 @@ jobs:
     secrets:
       review_token: ${{ secrets.DEPENDENCY_REVIEW_TOKEN }}
 ```
+
+When the root's base manifest declares `dependency-update:post` and that hook
+must align existing workspace overrides, add
+`post_update_workspace_overrides: '{".":["example-package"]}'` to `with`,
+replacing `example-package` with each exact existing override key the hook owns.
 
 Do not add automatic merge, publish, or deploy steps to this wrapper. The draft
 pull request is the review and recovery boundary.

@@ -25,8 +25,9 @@ automation for public/open-source repos that we want to maintain in one place.
   optional review token only for that isolated job, and do not pass inherited
   secrets.
 - Dependency and validation code runs in a read-only job. A fresh write-capable
-  job independently verifies only allowlisted manifests and lockfiles and never
-  executes package code.
+  job independently verifies only allowlisted manifests, lockfiles, and
+  explicitly opted-in workspace override values and never executes package
+  code.
 - npm package builds and lifecycle checks run without an OIDC token. A fresh
   publish job verifies one packed tarball and publishes it with lifecycle
   scripts disabled.
